@@ -1,0 +1,3 @@
+{"file":".trellis/tasks/07-18-k1-booster-migration/research.md","reason":"Defines the approved source evidence, migration candidates, exclusions, and adaptation boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Requires reuse of the existing A*, obstacle model, and centralized parameter definitions instead of parallel implementations."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Guides ownership of team state in strategy store and per-robot state on persistent Player instances."}

@@ -1,0 +1,3 @@
+{"file":".trellis/tasks/07-18-project-analysis/prd.md","reason":"Defines the approved analysis scope, evidence requirements, constraints, and acceptance criteria."}
+{"file":".trellis/tasks/07-18-project-analysis/design.md","reason":"Defines the evidence model, parallel workstreams, confidence labels, and output boundaries."}
+{"file":".trellis/tasks/07-18-project-analysis/implement.md","reason":"Provides the ordered static-analysis workflow and validation gates."}

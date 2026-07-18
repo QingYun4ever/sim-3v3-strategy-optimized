@@ -1,0 +1,12 @@
+---
+description: Leave all build and verification work to the user
+alwaysApply: true
+---
+
+# Manual Verification Only
+
+- Make the requested source or documentation changes, but do not run build, test, lint, type-check, formatting, simulation, deployment, or other verification commands.
+- Do not start development servers, runtime processes, simulators, or watchers to validate changes.
+- Do not use IDE diagnostics as a verification step after editing.
+- The user will manually perform all build and verification work.
+- In the final response, clearly state that verification was not run according to this project rule.

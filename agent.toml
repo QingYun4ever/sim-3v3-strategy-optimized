@@ -1,0 +1,11 @@
+id = "com.example.lqinternalmatch"
+version = "1.1.0"
+name = { en = "lqInternalMatch", zh = "lqInternalMatch" }
+logo = "/res/logo.png"
+description = "3v3 SoccerSim Agent written in Python"
+entry = "src/main.py:SoccerSimAgent"
+debuggable = true
+
+[requirements]
+min_api_level = 10700
+models = [ "Booster T1", "Booster K1" ]

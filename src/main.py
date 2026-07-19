@@ -91,6 +91,7 @@ class KickoffTacticState(Enum):
     PASS = "pass"
     VERIFY_FIRST_TOUCH = "verify_first_touch"
     RECEIVE_AND_SHOOT = "receive_and_shoot"
+    STABILIZE_SECOND_TOUCH = "stabilize_second_touch"
     VERIFY_SECOND_TOUCH = "verify_second_touch"
     COMPLETE = "complete"
     ABORT_BEFORE_FIRST_TOUCH = "abort_before_first_touch"
@@ -319,11 +320,16 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.kickoff_shot_start_ball = None
         store.kickoff_shot_start_seen_at = None
         store.kickoff_shot_attempts = 0
+        store.kickoff_shot_power = None
+        store.kickoff_ball_sample_position = None
+        store.kickoff_ball_sample_seen_at = None
+        store.kickoff_ball_speed_mps = 0.0
         store.kickoff_abort_reason = None
         store.kickoff_ready_passer_arrived = False
         store.kickoff_ready_shooter_arrived = False
         store.kickoff_safe_first_touch_player_id = None
         store.kickoff_safe_first_touch_done = False
+        store.ready_goalkeeper_entry_delay_started_at = None
         store.corner_tactic_state = CornerTacticState.IDLE
         store.corner_roles = None
         store.corner_tactic_started_at = None
@@ -3892,6 +3898,7 @@ def _should_finish_kickoff_second_touch(context: Context, store) -> bool:
     )
     if state in (
         KickoffTacticState.RECEIVE_AND_SHOOT,
+        KickoffTacticState.STABILIZE_SECOND_TOUCH,
         KickoffTacticState.VERIFY_SECOND_TOUCH,
     ):
         return bool(
@@ -3949,6 +3956,10 @@ def _clear_kickoff_tactic(store, reason: str) -> None:
     store.kickoff_shot_start_ball = None
     store.kickoff_shot_start_seen_at = None
     store.kickoff_shot_attempts = 0
+    store.kickoff_shot_power = None
+    store.kickoff_ball_sample_position = None
+    store.kickoff_ball_sample_seen_at = None
+    store.kickoff_ball_speed_mps = 0.0
     store.kickoff_abort_reason = reason
     store.kickoff_ready_passer_arrived = False
     store.kickoff_ready_shooter_arrived = False
@@ -4205,12 +4216,83 @@ def _ball_in_kickoff_receive_zone(
     robot_to_ball = angle_to(pose.x, pose.y, ball.x, ball.y)
     ball_bearing = abs(_normalize_angle(robot_to_ball - pose.theta))
     goal_facing_error = abs(_normalize_angle(goal_heading - pose.theta))
+    desired_behind_angle = _normalize_angle(goal_heading + math.pi)
+    player_angle_around_ball = angle_to(ball.x, ball.y, pose.x, pose.y)
+    alignment_error = abs(_normalize_angle(
+        desired_behind_angle - player_angle_around_ball,
+    ))
     return (
-        ball_receive_distance <= KICKOFF_RECEIVE_ZONE_RADIUS_M
-        or shooter_ball_distance <= KICKOFF_SHOT_KICK_DISTANCE_M
-    ) and (
-        ball_bearing <= KICKOFF_SHOT_BALL_BEARING_RAD
+        shooter_ball_distance <= KICKOFF_SHOT_KICK_DISTANCE_M
+        and ball_receive_distance
+        <= KICKOFF_RECEIVE_ZONE_RADIUS_M * 1.5
+        and ball_bearing <= KICKOFF_SHOT_BALL_BEARING_RAD
         and goal_facing_error <= KICKOFF_SHOT_GOAL_FACING_RAD
+        and alignment_error <= KICKOFF_SHOT_ALIGNMENT_RAD
+    )
+
+
+def _update_kickoff_ball_speed(context: Context, store) -> None:
+    """用相邻有效观测估计开球来球速度，供第二脚安全降力。"""
+    ball = context.ball
+    if ball is None:
+        return
+
+    sample_seen_at = (
+        ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
+    )
+    previous_position = getattr(
+        store,
+        "kickoff_ball_sample_position",
+        None,
+    )
+    previous_seen_at = getattr(
+        store,
+        "kickoff_ball_sample_seen_at",
+        None,
+    )
+    if (
+        previous_position is not None
+        and previous_seen_at is not None
+        and sample_seen_at > previous_seen_at
+    ):
+        sample_interval = sample_seen_at - previous_seen_at
+        if 0.01 <= sample_interval <= 0.50:
+            sample_distance = dist(
+                ball.x,
+                ball.y,
+                previous_position[0],
+                previous_position[1],
+            )
+            store.kickoff_ball_speed_mps = (
+                sample_distance / sample_interval
+            )
+
+    if previous_seen_at is None or sample_seen_at > previous_seen_at:
+        store.kickoff_ball_sample_position = (ball.x, ball.y)
+        store.kickoff_ball_sample_seen_at = sample_seen_at
+
+
+def _kickoff_second_touch_power(
+    shooter: Player,
+    shot_target: tuple[float, float],
+    store,
+) -> float:
+    """高速滚动球降低第二脚力度，减少冲击导致的失衡。"""
+    base_power = shooter.shot_power_for_target(shot_target)
+    ball_speed = max(
+        0.0,
+        float(getattr(store, "kickoff_ball_speed_mps", 0.0)),
+    )
+    if ball_speed >= KICKOFF_SHOT_FAST_BALL_SPEED_MPS:
+        power_reduction = KICKOFF_SHOT_FAST_POWER_REDUCTION
+    elif ball_speed >= KICKOFF_SHOT_MEDIUM_BALL_SPEED_MPS:
+        power_reduction = KICKOFF_SHOT_MEDIUM_POWER_REDUCTION
+    else:
+        power_reduction = 0.0
+    return clamp(
+        base_power - power_reduction,
+        KICK_POWER_MIN,
+        KICK_POWER_MAX,
     )
 
 
@@ -4526,6 +4608,8 @@ def _act_our_kickoff(
         _draw_kickoff_tactic(context, store)
         return
 
+    _update_kickoff_ball_speed(context, store)
+
     state = getattr(
         store,
         "kickoff_tactic_state",
@@ -4724,32 +4808,20 @@ def _act_our_kickoff(
                 roles.receive_target,
             )
             if shoot_now:
-                shot_target = opponent_goal(context)
-                shot_power = shooter.shot_power_for_target(shot_target)
-                kicked = _command_kickoff_direct_touch(
-                    shooter,
-                    shot_target,
-                    shot_power,
-                    "kickoff:shooter_shoot",
-                    kick_distance=KICKOFF_SHOT_KICK_DISTANCE_M,
-                    alignment_tolerance=KICKOFF_SHOT_ALIGNMENT_RAD,
-                    ball_bearing_tolerance=KICKOFF_SHOT_BALL_BEARING_RAD,
-                    approach_behind=KICKOFF_SHOT_APPROACH_BEHIND_M,
+                shooter.release_kick()
+                ball = context.ball
+                if ball is not None:
+                    shooter.face_to(angle_to(
+                        ball.x,
+                        ball.y,
+                        *opponent_goal(context),
+                    ))
+                shooter.action = "kickoff:shooter_stabilize"
+                _enter_kickoff_state(
+                    store,
+                    KickoffTacticState.STABILIZE_SECOND_TOUCH,
+                    context.now,
                 )
-                if kicked:
-                    ball = context.ball
-                    if ball is not None:
-                        store.kickoff_shot_start_ball = (ball.x, ball.y)
-                        store.kickoff_shot_start_seen_at = (
-                            ball.last_seen_at
-                            if ball.last_seen_at > 0.0 else context.now
-                        )
-                    store.kickoff_shot_attempts += 1
-                    _enter_kickoff_state(
-                        store,
-                        KickoffTacticState.VERIFY_SECOND_TOUCH,
-                        context.now,
-                    )
             else:
                 shooter.walk_to(
                     roles.receive_target,
@@ -4763,6 +4835,65 @@ def _act_our_kickoff(
                     arrive_dist=KICKOFF_READY_ARRIVE_M,
                 )
                 shooter.action = "kickoff:shooter_receive"
+        _draw_kickoff_tactic(context, store)
+        return
+
+    if state == KickoffTacticState.STABILIZE_SECOND_TOUCH:
+        _act_kickoff_passer_protect(context, passer, roles)
+        ball = context.ball
+        shooter_pose = shooter.pose
+        if ball is None or shooter_pose is None:
+            _abort_kickoff_tactic(context, store, "second_touch_ball_unknown")
+            _draw_kickoff_tactic(context, store)
+            return
+
+        still_in_touch_window = _ball_in_kickoff_receive_zone(
+            context,
+            shooter,
+            roles.receive_target,
+        )
+        if not still_in_touch_window:
+            shooter.action = "kickoff:shooter_stabilize_lost_ball"
+            shooter.stop()
+            _enter_kickoff_state(
+                store,
+                KickoffTacticState.RECEIVE_AND_SHOOT,
+                context.now,
+            )
+            _draw_kickoff_tactic(context, store)
+            return
+
+        shot_target = opponent_goal(context)
+        shot_direction = angle_to(ball.x, ball.y, *shot_target)
+        shooter.face_to(shot_direction)
+        shooter.action = "kickoff:shooter_stabilize"
+        stabilization_complete = (
+            state_entered_at is not None
+            and context.now - state_entered_at
+            >= KICKOFF_SHOT_STABILIZE_SEC
+        )
+        if not stabilization_complete:
+            _draw_kickoff_tactic(context, store)
+            return
+
+        shot_power = _kickoff_second_touch_power(
+            shooter,
+            shot_target,
+            store,
+        )
+        shooter.kick(shot_direction, shot_power)
+        shooter.action = "kickoff:shooter_shoot:kick"
+        store.kickoff_shot_start_ball = (ball.x, ball.y)
+        store.kickoff_shot_start_seen_at = (
+            ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
+        )
+        store.kickoff_shot_power = shot_power
+        store.kickoff_shot_attempts += 1
+        _enter_kickoff_state(
+            store,
+            KickoffTacticState.VERIFY_SECOND_TOUCH,
+            context.now,
+        )
         _draw_kickoff_tactic(context, store)
         return
 
@@ -4801,7 +4932,8 @@ def _act_our_kickoff(
             )
             shooter.kick(
                 shot_direction,
-                shooter.shot_power_for_target(shot_target),
+                getattr(store, "kickoff_shot_power", None)
+                or _kickoff_second_touch_power(shooter, shot_target, store),
             )
             shooter.action = "kickoff:verify_second_touch:kicking"
         _act_kickoff_passer_protect(context, passer, roles)
@@ -5996,6 +6128,45 @@ def _act_opp_set_play(
         )
 
 
+def _ready_goalkeeper_entry_delay_active(
+    context: Context,
+    goalkeeper: Player | None,
+    field_players: list[Player],
+    store,
+) -> bool:
+    """仅在刚进入 READY 且出生区域拥挤时延迟守门员出发。"""
+    if getattr(store, "prev_phase", None) != Phase.READY:
+        goalkeeper_pose = goalkeeper.pose if goalkeeper is not None else None
+        nearby_field_player_exists = (
+            goalkeeper_pose is not None
+            and any(
+                player.pose is not None
+                and dist(
+                    goalkeeper_pose.x,
+                    goalkeeper_pose.y,
+                    player.pose.x,
+                    player.pose.y,
+                ) <= READY_GOALKEEPER_ENTRY_CONGESTION_M
+                for player in field_players
+            )
+        )
+        store.ready_goalkeeper_entry_delay_started_at = (
+            context.now if nearby_field_player_exists else None
+        )
+
+    delay_started_at = getattr(
+        store,
+        "ready_goalkeeper_entry_delay_started_at",
+        None,
+    )
+    return (
+        goalkeeper is not None
+        and delay_started_at is not None
+        and context.now - delay_started_at
+        < READY_GOALKEEPER_ENTRY_DELAY_SEC
+    )
+
+
 def _act_ready(
     context: Context,
     players: list[Player],
@@ -6013,28 +6184,46 @@ def _act_ready(
         and game.kicking_team != KICKING_TEAM_NONE
         and game.kicking_team != context.team_id
     )
+    field_players = [
+        player for player in players if player is not goalkeeper
+    ]
+    goalkeeper_entry_delay_active = (
+        _ready_goalkeeper_entry_delay_active(
+            context,
+            goalkeeper,
+            field_players,
+            store,
+        )
+    )
     if opponent_kickoff:
         _clear_kickoff_tactic(store, "opponent_ready")
-        _act_opponent_kickoff_ready(context, players, goalkeeper)
+        _act_opponent_kickoff_ready(
+            context,
+            players,
+            goalkeeper,
+            delay_goalkeeper=goalkeeper_entry_delay_active,
+        )
         return
 
     field = context.field
     if goalkeeper is not None:
-        goalkeeper.action = (
-            "ready:temp_goalkeeper"
-            if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None)
-            else "ready:goalkeeper"
-        )
-        goalkeeper.walk_to(
-            own_goal_area_center(context),
-            face=0.0,
-            avoid_ball=True,
-            avoid_robots=True,
-        )
+        if goalkeeper_entry_delay_active:
+            goalkeeper.action = "ready:goalkeeper_entry_delay"
+            goalkeeper.stop()
+        else:
+            goalkeeper.action = (
+                "ready:temp_goalkeeper"
+                if goalkeeper.id
+                == getattr(store, "temporary_goalkeeper_id", None)
+                else "ready:goalkeeper"
+            )
+            goalkeeper.walk_to(
+                own_goal_area_center(context),
+                face=0.0,
+                avoid_ball=True,
+                avoid_robots=True,
+            )
 
-    field_players = [
-        player for player in players if player is not goalkeeper
-    ]
     if our_kickoff:
         if _initialize_our_kickoff_tactic(context, field_players, store):
             roles = getattr(store, "kickoff_roles", None)
@@ -6075,22 +6264,6 @@ def _act_ready(
                     player.action = "kickoff:ready_hold"
                     player.stop()
 
-                kickoff_setup_started_at = getattr(
-                    store,
-                    "kickoff_state_entered_at",
-                    None,
-                )
-                goalkeeper_delay_active = (
-                    goalkeeper is not None
-                    and kickoff_setup_started_at is not None
-                    and context.now - kickoff_setup_started_at
-                    < KICKOFF_GOALKEEPER_READY_DELAY_SEC
-                )
-                if goalkeeper_delay_active:
-                    # 初始重置点附近三台机器人容易互相卡住；先让两名前场
-                    # 离开拥挤区，再放行守门员前往己方门前。
-                    goalkeeper.action = "kickoff:goalkeeper_ready_delay"
-                    goalkeeper.stop()
                 _draw_kickoff_tactic(context, store)
                 return
 
@@ -6122,6 +6295,8 @@ def _act_opponent_kickoff_ready(
     context: Context,
     players: list[Player],
     goalkeeper: Player | None,
+    *,
+    delay_goalkeeper: bool = False,
 ) -> None:
     """Move to conservative kickoff slots under complete-segment rules."""
     field = context.field
@@ -6132,6 +6307,10 @@ def _act_opponent_kickoff_ready(
     field_player_index = 0
     for player in players:
         if player is goalkeeper:
+            if delay_goalkeeper:
+                player.action = "ready:goalkeeper_entry_delay"
+                player.stop()
+                continue
             target = own_goal_area_center(context)
             action = "opp_kickoff_ready:goalkeeper"
         else:

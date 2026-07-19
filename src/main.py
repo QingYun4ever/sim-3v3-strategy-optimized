@@ -3836,14 +3836,10 @@ def _kickoff_layout_for_side(
     side_sign: float,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """返回镜像后的 passer setup、shooter setup 和接应点。"""
-    legal_setup_x = min(
-        KICKOFF_PASSER_SETUP_X_M,
-        -context.field.circle_radius - KICKOFF_CENTER_CIRCLE_CLEARANCE_M,
-    )
     passer_setup = _kickoff_clamp_target(
         context,
         (
-            legal_setup_x,
+            KICKOFF_PASSER_SETUP_X_M,
             KICKOFF_PASSER_SETUP_Y_M * side_sign,
         ),
     )
@@ -4247,6 +4243,31 @@ def _act_kickoff_passer_protect(
     passer.action = "kickoff:passer_protect"
 
 
+def _hold_kickoff_shooter_before_first_touch(
+    context: Context,
+    shooter: Player,
+    roles: KickoffRoles,
+) -> None:
+    """第一脚确认前让接应者留在己方半场 setup，禁止提前前插。"""
+    shooter_pose = shooter.pose
+    shot_heading = (
+        angle_to(
+            shooter_pose.x,
+            shooter_pose.y,
+            *opponent_goal(context),
+        )
+        if shooter_pose is not None else 0.0
+    )
+    shooter.walk_to(
+        roles.shooter_setup,
+        face=shot_heading,
+        avoid_ball=False,
+        avoid_robots=False,
+        arrive_dist=KICKOFF_READY_ARRIVE_M,
+    )
+    shooter.action = "kickoff:shooter_wait_first_touch"
+
+
 def _draw_kickoff_tactic(context: Context, store) -> None:
     from .framework import debugdraw
 
@@ -4413,17 +4434,10 @@ def _act_our_kickoff(
                     avoid_robots=False,
                     arrive_dist=ARRIVE_DIST,
                 )
-            shooter.action = "kickoff:shooter_receive"
-            shooter.walk_to(
-                roles.receive_target,
-                face=angle_to(
-                    shooter.pose.x,
-                    shooter.pose.y,
-                    *opponent_goal(context),
-                ) if shooter.pose is not None else 0.0,
-                avoid_ball=False,
-                avoid_robots=True,
-                arrive_dist=KICKOFF_READY_ARRIVE_M,
+            _hold_kickoff_shooter_before_first_touch(
+                context,
+                shooter,
+                roles,
             )
             timed_out = (
                 state_entered_at is not None
@@ -4467,18 +4481,11 @@ def _act_our_kickoff(
             )
             store.kickoff_pass_attempts += 1
             store.kickoff_last_pass_attempt_at = context.now
-        shooter.walk_to(
-            roles.receive_target,
-            face=angle_to(
-                shooter.pose.x,
-                shooter.pose.y,
-                *opponent_goal(context),
-            ) if shooter.pose is not None else 0.0,
-            avoid_ball=False,
-            avoid_robots=True,
-            arrive_dist=KICKOFF_READY_ARRIVE_M,
+        _hold_kickoff_shooter_before_first_touch(
+            context,
+            shooter,
+            roles,
         )
-        shooter.action = "kickoff:shooter_receive"
         if kicked:
             _enter_kickoff_state(
                 store,
@@ -4523,22 +4530,31 @@ def _act_our_kickoff(
             else:
                 passer.action = "kickoff:verify_first_touch:no_ball"
                 passer.stop()
-            shooter.walk_to(
-                roles.receive_target,
-                face=angle_to(
-                    shooter.pose.x,
-                    shooter.pose.y,
-                    *opponent_goal(context),
-                ) if shooter.pose is not None else 0.0,
-                avoid_ball=False,
-                avoid_robots=True,
-                arrive_dist=KICKOFF_READY_ARRIVE_M,
+            _hold_kickoff_shooter_before_first_touch(
+                context,
+                shooter,
+                roles,
             )
-            shooter.action = "kickoff:shooter_receive"
         _draw_kickoff_tactic(context, store)
         return
 
     if state == KickoffTacticState.RECEIVE_AND_SHOOT:
+        release_delay_active = (
+            state_entered_at is not None
+            and context.now - state_entered_at
+            < KICKOFF_SHOOTER_RELEASE_DELAY_SEC
+        )
+        if release_delay_active:
+            _act_kickoff_passer_protect(context, passer, roles)
+            _hold_kickoff_shooter_before_first_touch(
+                context,
+                shooter,
+                roles,
+            )
+            shooter.action = "kickoff:shooter_release_delay"
+            _draw_kickoff_tactic(context, store)
+            return
+
         if _kickoff_opponent_controls_ball(context):
             _enter_kickoff_state(
                 store,

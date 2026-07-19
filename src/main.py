@@ -496,6 +496,94 @@ def _act_normal_front_partner(front_partner: Player) -> None:
     front_partner.action = "normal:front_partner:support"
 
 
+def _should_enter_normal_defense(context: Context) -> bool:
+    """只在已知球明确进入己方半场时启用普通比赛防守阵型。"""
+    ball = context.ball
+    return ball is not None and ball.x < NORMAL_DEFENSE_BALL_X_MAX_M
+
+
+def _get_normal_defense_protect_target(
+    context: Context,
+) -> tuple[float, float] | None:
+    """计算球到己方球门线段上的保护点。"""
+    ball = context.ball
+    if ball is None:
+        return None
+
+    own_goal_x, own_goal_y = own_goal(context)
+    route_x = own_goal_x - ball.x
+    route_y = own_goal_y - ball.y
+    route_length = math.hypot(route_x, route_y)
+    if route_length <= 1e-6:
+        return own_goal_area_center(context)
+
+    desired_route_ratio = min(
+        1.0,
+        NORMAL_DEFENSE_PROTECT_DISTANCE_M / route_length,
+    )
+    if route_length > NORMAL_DEFENSE_GOAL_LINE_CLEARANCE_M:
+        maximum_route_ratio = (
+            1.0
+            - NORMAL_DEFENSE_GOAL_LINE_CLEARANCE_M / route_length
+        )
+    else:
+        # 球已贴近门线时无法同时满足门线余量，退化为线段中点。
+        maximum_route_ratio = 0.5
+
+    half_length = context.field.length / 2.0
+    field_margin_x = -half_length + NORMAL_DEFENSE_FIELD_MARGIN_M
+    if ball.x >= field_margin_x and ball.x > own_goal_x:
+        maximum_field_ratio = (
+            (ball.x - field_margin_x) / (ball.x - own_goal_x)
+        )
+        maximum_route_ratio = min(
+            maximum_route_ratio,
+            maximum_field_ratio,
+        )
+
+    route_ratio = clamp(
+        min(desired_route_ratio, maximum_route_ratio),
+        0.0,
+        1.0,
+    )
+    return (
+        ball.x + route_x * route_ratio,
+        ball.y + route_y * route_ratio,
+    )
+
+
+def _act_normal_defense(
+    context: Context,
+    goalkeeper: Player | None,
+    pressure_player: Player | None,
+    protect_player: Player | None,
+    store,
+) -> None:
+    """按已分配职责执行普通比赛的守门、逼抢和保护。"""
+    if goalkeeper is not None:
+        goalkeeper.guard()
+        goalkeeper_kind = (
+            "temporary"
+            if goalkeeper.id == getattr(
+                store, "temporary_goalkeeper_id", None,
+            )
+            else "default"
+        )
+        goalkeeper.action = f"defense:goalkeeper:{goalkeeper_kind}"
+
+    if pressure_player is not None:
+        pressure_player.action = "attack"
+        pressure_player.attack()
+        pressure_player.action = (
+            f"defense:pressure:{pressure_player.action}"
+        )
+
+    if protect_player is not None:
+        protect_target = _get_normal_defense_protect_target(context)
+        protect_player.move_to_position(protect_target)
+        protect_player.action = "defense:protect"
+
+
 def _act_normal(
     context: Context,
     players: list[Player],
@@ -557,6 +645,16 @@ def _act_normal(
             for player in assigned_field_players:
                 player.action = "ball_unknown:stop"
                 player.stop()
+        return
+
+    if allow_ball_search and _should_enter_normal_defense(context):
+        _act_normal_defense(
+            context,
+            role_goalkeeper,
+            primary_attacker,
+            front_partner,
+            store,
+        )
         return
 
     if role_goalkeeper is not None:

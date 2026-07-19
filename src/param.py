@@ -87,6 +87,14 @@ ATTACKER_KEEP_DIST_MARGIN_M = 0.3  # 防止 Attacker 选择产生震荡
 
 FALLEN_COST = 10.0  # 摔倒球员的距离惩罚值(米)
 
+# 普通比赛只在球明确进入己方半场时切换到保守 1-1-1 防守。
+NORMAL_DEFENSE_BALL_X_MAX_M = 0.0
+
+# 保护球员沿球到己方球门的连线站位，并尽量与球保持可用拦截距离。
+NORMAL_DEFENSE_PROTECT_DISTANCE_M = 2.0
+NORMAL_DEFENSE_GOAL_LINE_CLEARANCE_M = 1.0
+NORMAL_DEFENSE_FIELD_MARGIN_M = 0.3
+
 
 # ======================================================================
 # 丢球恢复

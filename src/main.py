@@ -4639,7 +4639,7 @@ def _act_our_kickoff(
                     kick_distance=KICKOFF_SHOT_KICK_DISTANCE_M,
                     alignment_tolerance=KICKOFF_SHOT_ALIGNMENT_RAD,
                     ball_bearing_tolerance=KICKOFF_SHOT_BALL_BEARING_RAD,
-                    approach_behind=KICKOFF_PASS_APPROACH_BEHIND_M,
+                    approach_behind=KICKOFF_SHOT_APPROACH_BEHIND_M,
                 )
                 if kicked:
                     ball = context.ball

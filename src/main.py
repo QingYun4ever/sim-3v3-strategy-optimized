@@ -5023,6 +5023,23 @@ def _act_ready(
                         continue
                     player.action = "kickoff:ready_hold"
                     player.stop()
+
+                kickoff_setup_started_at = getattr(
+                    store,
+                    "kickoff_state_entered_at",
+                    None,
+                )
+                goalkeeper_delay_active = (
+                    goalkeeper is not None
+                    and kickoff_setup_started_at is not None
+                    and context.now - kickoff_setup_started_at
+                    < KICKOFF_GOALKEEPER_READY_DELAY_SEC
+                )
+                if goalkeeper_delay_active:
+                    # 初始重置点附近三台机器人容易互相卡住；先让两名前场
+                    # 离开拥挤区，再放行守门员前往己方门前。
+                    goalkeeper.action = "kickoff:goalkeeper_ready_delay"
+                    goalkeeper.stop()
                 _draw_kickoff_tactic(context, store)
                 return
 

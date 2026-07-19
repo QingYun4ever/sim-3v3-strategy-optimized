@@ -938,6 +938,8 @@ class Player:
         self,
         clearance_target: tuple[float, float],
         power: float,
+        *,
+        avoid_crowding: bool = False,
     ) -> None:
         """快速处理后场球，使用宽松对齐和短球后接近，不进入普通射门绕球流程。"""
         self._reset_ball_approach()
@@ -975,6 +977,10 @@ class Player:
             and alignment_error <= DEFENSIVE_QUICK_KICK_ALIGNMENT_RAD
             and ball_bearing <= DEFENSIVE_QUICK_KICK_BALL_BEARING_RAD
         )
+        unsafe_contact_position = (
+            alignment_error > DEFENSIVE_QUICK_KICK_ALIGNMENT_RAD
+            or ball_bearing > DEFENSIVE_QUICK_KICK_BALL_BEARING_RAD
+        )
 
         self._draw_kick_target(safe_target)
         if can_kick_now:
@@ -983,23 +989,31 @@ class Player:
             return
 
         self.release_kick()
+        approach_offset = (
+            DEFENSIVE_CROWD_APPROACH_BEHIND_M
+            if avoid_crowding else DEFENSIVE_QUICK_APPROACH_BEHIND_M
+        )
         approach_target = _behind_ball(
             ball.x,
             ball.y,
             safe_target,
-            DEFENSIVE_QUICK_APPROACH_BEHIND_M,
+            approach_offset,
         )
         self.walk_to(
             approach_target,
             face=kick_direction,
-            avoid_ball=False,
-            avoid_robots=False,
+            avoid_ball=avoid_crowding,
+            avoid_robots=avoid_crowding,
             arrive_dist=min(
                 ARRIVE_DIST,
-                DEFENSIVE_QUICK_APPROACH_BEHIND_M * 0.75,
+                approach_offset * 0.75,
             ),
         )
-        self.action = "defensive_clear:approach"
+        self.action = (
+            "defensive_clear:reposition"
+            if avoid_crowding and unsafe_contact_position
+            else "defensive_clear:approach"
+        )
 
     def support(self) -> None:
         """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。

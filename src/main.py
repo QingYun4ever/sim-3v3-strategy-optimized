@@ -223,6 +223,11 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.deep_defense_clearance_level = None
         store.deep_defense_clearance_power = None
         store.deep_defense_goalkeeper_priority = False
+        store.deep_defense_crowded = False
+        store.deep_defense_crowded_entered_at = None
+        store.deep_defense_crowd_count = 0
+        store.deep_defense_ball_owner_id = None
+        store.deep_defense_outward_target = None
         store.goalkeeper_strategy_player_id = None
         store.goalkeeper_mode = None
         store.goalkeeper_mode_entered_at = None
@@ -506,6 +511,11 @@ def _clear_normal_sticky(store) -> None:
     store.deep_defense_clearance_level = None
     store.deep_defense_clearance_power = None
     store.deep_defense_goalkeeper_priority = False
+    store.deep_defense_crowded = False
+    store.deep_defense_crowded_entered_at = None
+    store.deep_defense_crowd_count = 0
+    store.deep_defense_ball_owner_id = None
+    store.deep_defense_outward_target = None
     _reset_goalkeeper_handover_state(store)
 
 
@@ -1115,7 +1125,69 @@ def _update_deep_defense_state(context: Context, store) -> bool:
         store.deep_defense_clearance_level = None
         store.deep_defense_clearance_power = None
         store.deep_defense_goalkeeper_priority = False
+        store.deep_defense_crowded = False
+        store.deep_defense_crowded_entered_at = None
+        store.deep_defense_crowd_count = 0
+        store.deep_defense_ball_owner_id = None
+        store.deep_defense_outward_target = None
     return active
+
+
+def _count_robots_near_ball(context: Context, radius: float) -> int:
+    """统计球附近具有有效位姿的双方机器人，包含倒地或不可用的物理障碍。"""
+    ball = context.ball
+    if ball is None:
+        return 0
+
+    nearby_count = 0
+    for robot in (
+        list(context.teammates.values())
+        + list(context.opponents.values())
+    ):
+        pose = robot.pose
+        if (
+            pose is not None
+            and dist(pose.x, pose.y, ball.x, ball.y) <= radius
+        ):
+            nearby_count += 1
+    return nearby_count
+
+
+def _update_deep_defense_crowding(context: Context, store) -> bool:
+    """根据球周围人数更新拥挤子模式，并使用人数迟滞防止频繁切换。
+
+    语义为达到 ``DEEP_DEFENSE_CROWD_ENTER_COUNT`` 进入拥挤；进入后人数
+    降到 ``DEEP_DEFENSE_CROWD_EXIT_COUNT`` 或更少即退出。这样 3 人混战进入，
+    下降到 2 人时恢复普通深度防守结构。
+    """
+    crowd_count = _count_robots_near_ball(
+        context,
+        DEEP_DEFENSE_CROWD_RADIUS_M,
+    )
+    previous_crowded = bool(
+        getattr(store, "deep_defense_crowded", False),
+    )
+    if previous_crowded:
+        crowded = crowd_count > DEEP_DEFENSE_CROWD_EXIT_COUNT
+    else:
+        crowded = crowd_count >= DEEP_DEFENSE_CROWD_ENTER_COUNT
+
+    if crowded != previous_crowded:
+        store.deep_defense_crowded_entered_at = (
+            context.now if crowded else None
+        )
+        _log.info(
+            "deep defense crowded %s -> %s nearby=%d",
+            previous_crowded,
+            crowded,
+            crowd_count,
+        )
+
+    store.deep_defense_crowded = crowded
+    store.deep_defense_crowd_count = crowd_count
+    if not crowded:
+        store.deep_defense_outward_target = None
+    return crowded
 
 
 def _get_controlled_clearance_target(
@@ -1217,6 +1289,9 @@ def _draw_deep_defense_state(context: Context, store) -> None:
         "deep_defense_goalkeeper_priority",
         False,
     )
+    crowded = getattr(store, "deep_defense_crowded", False)
+    crowd_count = getattr(store, "deep_defense_crowd_count", 0)
+    ball_owner_id = getattr(store, "deep_defense_ball_owner_id", None)
     debugdraw.text(
         0.0,
         context.field.width / 2.0 + 1.25,
@@ -1225,7 +1300,9 @@ def _draw_deep_defense_state(context: Context, store) -> None:
             f"secondary={secondary_id or '-'} "
             f"clear={clearance_level or '-'} "
             f"power={clearance_power_label} "
-            f"goalkeeper_priority={goalkeeper_priority}"
+            f"goalkeeper_priority={goalkeeper_priority} "
+            f"crowded={crowded} count={crowd_count} "
+            f"owner={ball_owner_id or '-'}"
         ),
         rgb=(1.0, 0.55, 0.15),
         ns="deep_defense",
@@ -1256,6 +1333,20 @@ def _draw_deep_defense_state(context: Context, store) -> None:
             rgb=(1.0, 0.3, 0.7),
             scale=0.18,
             ns="deep_defense_secondary_target",
+        )
+
+    outward_target = getattr(
+        store,
+        "deep_defense_outward_target",
+        None,
+    )
+    if outward_target is not None:
+        debugdraw.point(
+            outward_target[0],
+            outward_target[1],
+            rgb=(1.0, 0.2, 0.2),
+            scale=0.20,
+            ns="deep_defense_outward_target",
         )
 
 
@@ -2364,9 +2455,15 @@ def _act_quick_defensive_clear(
     clearance_target: tuple[float, float],
     power: float,
     action_prefix: str,
+    *,
+    avoid_crowding: bool = False,
 ) -> None:
     """执行专用快速解围，并保留接近或出脚子状态。"""
-    player.quick_defensive_clear(clearance_target, power)
+    player.quick_defensive_clear(
+        clearance_target,
+        power,
+        avoid_crowding=avoid_crowding,
+    )
     subaction = _get_defensive_clear_subaction(player)
     player.action = f"{action_prefix}:{subaction}"
 
@@ -2481,6 +2578,135 @@ def _build_deep_defense_offset_target(
     return (target_x, target_y)
 
 
+def _select_deep_outward_wall_target(
+    context: Context,
+    wall_player: Player,
+    ball_owner: Player | None,
+    goalkeeper_target: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    """选择球门侧外压点，让非触球者封住回门路线并避开球权所有者。"""
+    ball = context.ball
+    pose = wall_player.pose
+    if ball is None or pose is None:
+        return None
+
+    own_goal_x, own_goal_y = own_goal(context)
+    goal_side_x = own_goal_x - ball.x
+    goal_side_y = own_goal_y - ball.y
+    goal_side_length = math.hypot(goal_side_x, goal_side_y)
+    if goal_side_length <= 1e-6:
+        goal_side_direction = (-1.0, 0.0)
+    else:
+        goal_side_direction = (
+            goal_side_x / goal_side_length,
+            goal_side_y / goal_side_length,
+        )
+    lateral_direction = (
+        -goal_side_direction[1],
+        goal_side_direction[0],
+    )
+
+    half_length = context.field.length / 2.0
+    half_width = context.field.width / 2.0
+    minimum_x = own_goal_x + NORMAL_DEFENSE_FIELD_MARGIN_M
+    maximum_x = half_length - NORMAL_DEFENSE_FIELD_MARGIN_M
+    minimum_y = -half_width + NORMAL_DEFENSE_FIELD_MARGIN_M
+    maximum_y = half_width - NORMAL_DEFENSE_FIELD_MARGIN_M
+    expanded_lateral_distance = max(
+        DEEP_DEFENSE_OUTWARD_WALL_LATERAL_M,
+        DEEP_DEFENSE_NON_OWNER_RADIUS_M + 0.15,
+    )
+
+    candidates: list[tuple[float, float]] = []
+    for goalward_distance in (
+        DEEP_DEFENSE_OUTWARD_WALL_DISTANCE_M,
+        DEEP_DEFENSE_OUTWARD_WALL_DISTANCE_M * 0.55,
+    ):
+        for lateral_distance in (
+            DEEP_DEFENSE_OUTWARD_WALL_LATERAL_M,
+            expanded_lateral_distance,
+        ):
+            for side in (-1.0, 1.0):
+                target_x = (
+                    ball.x
+                    + goal_side_direction[0] * goalward_distance
+                    + lateral_direction[0] * side * lateral_distance
+                )
+                target_y = (
+                    ball.y
+                    + goal_side_direction[1] * goalward_distance
+                    + lateral_direction[1] * side * lateral_distance
+                )
+                candidates.append((
+                    clamp(target_x, minimum_x, maximum_x),
+                    clamp(target_y, minimum_y, maximum_y),
+                ))
+
+    owner_pose = ball_owner.pose if ball_owner is not None else None
+    valid_candidates = [
+        target for target in candidates
+        if _deep_non_owner_target_is_safe(
+            context,
+            target,
+            goalkeeper_target=goalkeeper_target,
+            owner_pose=owner_pose,
+        )
+    ]
+    if not valid_candidates:
+        return None
+
+    def candidate_score(target: tuple[float, float]) -> float:
+        travel_distance = dist(pose.x, pose.y, target[0], target[1])
+        goal_side_progress = (
+            (target[0] - ball.x) * goal_side_direction[0]
+            + (target[1] - ball.y) * goal_side_direction[1]
+        )
+        center_recovery = abs(ball.y) - abs(target[1])
+        return (
+            goal_side_progress * 2.0
+            + center_recovery * 0.25
+            - travel_distance
+        )
+
+    return max(valid_candidates, key=candidate_score)
+
+
+def _act_deep_outward_wall(
+    context: Context,
+    wall_player: Player,
+    ball_owner: Player | None,
+    store,
+) -> None:
+    """让非触球防守者退出球周围，站到门侧并形成向正 X 的外压支撑。"""
+    target = _select_deep_outward_wall_target(
+        context,
+        wall_player,
+        ball_owner,
+        getattr(store, "goalkeeper_target", None),
+    )
+    store.deep_defense_outward_target = target
+    store.deep_defense_secondary_target = target
+    ball = context.ball
+    pose = wall_player.pose
+    if target is None or ball is None or pose is None:
+        wall_player.action = "defense:deep_outward_wall:stop"
+        wall_player.stop()
+        return
+
+    ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    wall_player.walk_to(
+        target,
+        face=angle_to(pose.x, pose.y, ball.x, ball.y),
+        avoid_ball=True,
+        avoid_robots=True,
+    )
+    wall_player.action = (
+        "defense:deep_non_owner_yield"
+        if ball_distance < DEEP_DEFENSE_NON_OWNER_RADIUS_M
+        else "defense:deep_outward_wall"
+    )
+
+
 def _select_deep_secondary_target(
     context: Context,
     secondary_player: Player,
@@ -2585,32 +2811,56 @@ def _select_deep_secondary_target(
 def _goalkeeper_has_deep_defense_priority(
     context: Context,
     goalkeeper: Player | None,
-    field_players: list[Player],
     store,
 ) -> bool:
-    """守门员正在 CLEAR，或 CHALLENGE 且场上球员未明显先到时让位。"""
+    """守门员进入主动处理状态后拥有硬球权，场上球员不得再争同一球。"""
     goalkeeper_mode = getattr(store, "goalkeeper_mode", None)
-    if goalkeeper_mode == GoalkeeperMode.CLEAR:
-        return True
+    return (
+        goalkeeper is not None
+        and goalkeeper.pose is not None
+        and context.ball is not None
+        and goalkeeper_mode in (
+            GoalkeeperMode.CHALLENGE,
+            GoalkeeperMode.CLEAR,
+        )
+    )
+
+
+def _deep_non_owner_target_is_safe(
+    context: Context,
+    target: tuple[float, float],
+    *,
+    goalkeeper_target: tuple[float, float] | None = None,
+    owner_pose=None,
+) -> bool:
+    """确认非触球防守点不会被 clamp 后挤回球、持球者或守门员目标附近。"""
+    ball = context.ball
     if (
-        goalkeeper_mode != GoalkeeperMode.CHALLENGE
-        or goalkeeper is None
-        or goalkeeper.pose is None
-        or context.ball is None
-        or not field_players
+        ball is not None
+        and dist(ball.x, ball.y, target[0], target[1])
+        < DEEP_DEFENSE_NON_OWNER_RADIUS_M
     ):
         return False
 
-    goalkeeper_distance = _player_dist_to_ball(context, goalkeeper)
-    nearest_field_distance = min(
-        _player_dist_to_ball(context, player)
-        for player in field_players
-    )
-    return (
-        goalkeeper_distance
-        <= nearest_field_distance
-        + DEEP_DEFENSE_GOALKEEPER_PRIORITY_MARGIN_M
-    )
+    if (
+        owner_pose is not None
+        and dist(owner_pose.x, owner_pose.y, target[0], target[1])
+        < DEEP_DEFENSE_NON_OWNER_RADIUS_M
+    ):
+        return False
+
+    if (
+        goalkeeper_target is not None
+        and dist(
+            goalkeeper_target[0],
+            goalkeeper_target[1],
+            target[0],
+            target[1],
+        ) < DEEP_DEFENSE_NON_OWNER_RADIUS_M
+    ):
+        return False
+
+    return True
 
 
 def _act_deep_defense_support_pair(
@@ -2627,51 +2877,55 @@ def _act_deep_defense_support_pair(
     if not available_pair:
         return
 
-    negative_target = _build_deep_defense_offset_target(context, -1.0)
-    positive_target = _build_deep_defense_offset_target(context, 1.0)
-    if negative_target is None or positive_target is None:
-        for player in available_pair:
-            player.action = "defense:deep_secondary:goalkeeper_yield"
-            player.stop()
-        return
-
-
+    goalkeeper_yield_offset = max(
+        DEEP_DEFENSE_SECONDARY_OFFSET_M,
+        DEEP_DEFENSE_NON_OWNER_RADIUS_M + 0.15,
+    )
     goalkeeper_target = getattr(store, "goalkeeper_target", None)
-    ball = context.ball
     expanded_offset = max(
         DEEP_DEFENSE_SECONDARY_OFFSET_M,
-        DEEP_DEFENSE_CHALLENGE_SPACING_M + 0.25,
+        DEEP_DEFENSE_NON_OWNER_RADIUS_M + 0.35,
+    )
+    fallback_offset = max(
+        expanded_offset,
+        DEEP_DEFENSE_NON_OWNER_RADIUS_M + 0.7,
     )
 
-    def ensure_target_spacing(
-        target: tuple[float, float],
+    def select_safe_yield_target(
         side: float,
-    ) -> tuple[float, float]:
-        has_ball_spacing = (
-            ball is None
-            or dist(ball.x, ball.y, target[0], target[1])
-            >= DEEP_DEFENSE_CHALLENGE_SPACING_M
-        )
-        has_goalkeeper_spacing = (
-            goalkeeper_target is None
-            or dist(
-                target[0],
-                target[1],
-                goalkeeper_target[0],
-                goalkeeper_target[1],
-            ) >= DEEP_DEFENSE_CHALLENGE_SPACING_M
-        )
-        if has_ball_spacing and has_goalkeeper_spacing:
-            return target
-        expanded_target = _build_deep_defense_offset_target(
-            context,
-            side,
+    ) -> tuple[float, float] | None:
+        for offset_distance in (
+            goalkeeper_yield_offset,
             expanded_offset,
-        )
-        return expanded_target or target
+            fallback_offset,
+        ):
+            target = _build_deep_defense_offset_target(
+                context,
+                side,
+                offset_distance,
+            )
+            if target is not None and _deep_non_owner_target_is_safe(
+                context,
+                target,
+                goalkeeper_target=goalkeeper_target,
+            ):
+                return target
+        return None
 
-    negative_target = ensure_target_spacing(negative_target, -1.0)
-    positive_target = ensure_target_spacing(positive_target, 1.0)
+    negative_target = select_safe_yield_target(-1.0)
+    positive_target = select_safe_yield_target(1.0)
+    if len(available_pair) == 1:
+        single_safe_target = negative_target or positive_target
+        negative_target = single_safe_target
+        positive_target = single_safe_target
+    if negative_target is None or positive_target is None:
+        for index, player in enumerate(available_pair):
+            role_label = "deep_primary" if index == 0 else "deep_secondary"
+            player.action = f"defense:{role_label}:goalkeeper_yield:stop"
+            player.stop()
+        store.deep_defense_secondary_target = None
+        store.deep_defense_outward_target = None
+        return
 
     first_player = available_pair[0]
     first_pose = first_player.pose
@@ -2702,8 +2956,8 @@ def _act_deep_defense_support_pair(
         player.walk_to(
             target,
             face=face,
-            avoid_ball=False,
-            avoid_robots=False,
+            avoid_ball=True,
+            avoid_robots=True,
         )
         role_label = "deep_primary" if index == 0 else "deep_secondary"
         player.action = f"defense:{role_label}:goalkeeper_yield"
@@ -2712,6 +2966,7 @@ def _act_deep_defense_support_pair(
         assigned_targets[1]
         if len(available_pair) > 1 else assigned_targets[0]
     )
+    store.deep_defense_outward_target = None
 
 
 def _act_deep_defense(
@@ -2724,23 +2979,34 @@ def _act_deep_defense(
     primary_player, secondary_player, secondary_took_over = (
         _select_deep_defense_challengers(context, field_players, store)
     )
+    crowded = _update_deep_defense_crowding(context, store)
     goalkeeper_priority = _goalkeeper_has_deep_defense_priority(
         context,
         goalkeeper,
-        field_players,
         store,
     )
     store.deep_defense_goalkeeper_priority = goalkeeper_priority
     if primary_player is None:
+        store.deep_defense_ball_owner_id = (
+            goalkeeper.id if goalkeeper is not None else None
+        )
         store.deep_defense_secondary_target = None
         store.deep_defense_clearance_target = None
         store.deep_defense_clearance_level = "goalkeeper_only"
         store.deep_defense_clearance_power = None
+        store.deep_defense_outward_target = None
         _draw_deep_defense_state(context, store)
         return
     if goalkeeper_priority:
+        store.deep_defense_ball_owner_id = goalkeeper.id
+        goalkeeper_mode = getattr(store, "goalkeeper_mode", None)
+        goalkeeper_priority_reason = (
+            "goalkeeper_clear_priority"
+            if goalkeeper_mode == GoalkeeperMode.CLEAR
+            else "goalkeeper_challenge_priority"
+        )
         store.deep_defense_clearance_target = None
-        store.deep_defense_clearance_level = "goalkeeper_active"
+        store.deep_defense_clearance_level = goalkeeper_priority_reason
         store.deep_defense_clearance_power = None
         _act_deep_defense_support_pair(
             context,
@@ -2751,35 +3017,58 @@ def _act_deep_defense(
         _draw_deep_defense_state(context, store)
         return
 
+    store.deep_defense_ball_owner_id = primary_player.id
+
     emergency_clearance = _is_emergency_defensive_clearance(context, store)
     clearance_target = _get_controlled_clearance_target(
         context,
         emergency=emergency_clearance,
     )
-    clearance_level = (
-        "emergency_clear" if emergency_clearance else "quick_clear"
-    )
+    if emergency_clearance:
+        clearance_level = "emergency_clear"
+    elif crowded:
+        clearance_level = "crowded_clear"
+    else:
+        clearance_level = "quick_clear"
     clearance_power = (
         DEFENSIVE_EMERGENCY_CLEAR_POWER
-        if emergency_clearance else DEFENSIVE_QUICK_CLEAR_POWER
+        if emergency_clearance
+        else (
+            DEEP_DEFENSE_CROWD_CLEAR_POWER
+            if crowded else DEFENSIVE_QUICK_CLEAR_POWER
+        )
     )
     store.deep_defense_clearance_target = clearance_target
     store.deep_defense_clearance_level = clearance_level
     store.deep_defense_clearance_power = clearance_power
 
     if primary_player is not None and clearance_target is not None:
-        role_label = (
-            "deep_secondary_takeover"
-            if secondary_took_over else "deep_primary"
-        )
+        if secondary_took_over:
+            role_label = "deep_owner_takeover"
+        elif crowded:
+            role_label = "deep_crowded_owner"
+        else:
+            role_label = "deep_primary"
         _act_quick_defensive_clear(
             primary_player,
             clearance_target,
             clearance_power,
             f"defense:{role_label}:{clearance_level}",
+            avoid_crowding=crowded,
         )
 
     if secondary_player is not None:
+        if crowded:
+            _act_deep_outward_wall(
+                context,
+                secondary_player,
+                primary_player,
+                store,
+            )
+            _draw_deep_defense_state(context, store)
+            return
+
+        store.deep_defense_outward_target = None
         secondary_target = _select_deep_secondary_target(
             context,
             secondary_player,
@@ -2803,12 +3092,13 @@ def _act_deep_defense(
             secondary_player.walk_to(
                 secondary_target,
                 face=face,
-                avoid_ball=False,
-                avoid_robots=False,
+                avoid_ball=True,
+                avoid_robots=True,
             )
             secondary_player.action = "defense:deep_secondary:close"
     else:
         store.deep_defense_secondary_target = None
+        store.deep_defense_outward_target = None
 
     _draw_deep_defense_state(context, store)
 

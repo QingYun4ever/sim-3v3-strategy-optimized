@@ -60,16 +60,17 @@ CLEARANCE_SPEED_FULL_M = 0.65
 
 KICK_ENTER_M = 2.0             # 距球小于该值进入踢球状态
 KICK_EXIT_M = 2.5              # 踢球中距球大于该值才退出踢球状态
-CHASE_BEHIND_M = 0.35          # 追球时站到球后方的距离
+CHASE_BEHIND_M = 0.20          # 快速进攻只保留最短球后调整距离
 
-# 机器人位于球的错误一侧时,先沿球周围的圆弧绕到射门线后方。
-CHASE_CIRCLE_RADIUS_M = 0.65
-CHASE_CIRCLE_STEP_RAD = math.radians(35.0)
-CHASE_DIRECT_ENTER_ANGLE_RAD = math.radians(25.0)
-CHASE_DIRECT_EXIT_ANGLE_RAD = math.radians(40.0)
-CHASE_CIRCLE_PROGRESS_RAD = math.radians(5.0)
-CHASE_CIRCLE_TIMEOUT_SEC = 3.0
-CHASE_CIRCLE_FALLBACK_SEC = 1.0
+# 普通进攻优先快速出脚：仅在明显位于球的错误一侧时短距离绕行，
+# 放宽球后对齐门槛并增大单次调整步幅，避免长时间瞄准和绕球。
+CHASE_CIRCLE_RADIUS_M = 0.50
+CHASE_CIRCLE_STEP_RAD = math.radians(60.0)
+CHASE_DIRECT_ENTER_ANGLE_RAD = math.radians(65.0)
+CHASE_DIRECT_EXIT_ANGLE_RAD = math.radians(90.0)
+CHASE_CIRCLE_PROGRESS_RAD = math.radians(3.0)
+CHASE_CIRCLE_TIMEOUT_SEC = 1.0
+CHASE_CIRCLE_FALLBACK_SEC = 0.50
 
 
 # ======================================================================

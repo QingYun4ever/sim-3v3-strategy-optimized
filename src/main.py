@@ -4355,20 +4355,25 @@ def _act_our_kickoff(
         KickoffTacticState.IDLE,
     )
     state_entered_at = getattr(store, "kickoff_state_entered_at", None)
-    tactic_started_at = getattr(store, "kickoff_tactic_started_at", None)
-    if tactic_started_at is not None and (
-        context.now - tactic_started_at > KICKOFF_TOTAL_TIMEOUT_SEC
-    ):
-        _abort_kickoff_tactic(context, store, "total_timeout")
-        state = getattr(store, "kickoff_tactic_state")
 
     if state in (
         KickoffTacticState.IDLE,
         KickoffTacticState.SETUP,
         KickoffTacticState.WAIT_FOR_PLAYING,
     ):
+        # 总战术超时只用于 PLAYING 后的战术失败退出，不能把 READY/SET
+        # 等待裁判的时间算进去，否则一开球就会立刻超时并站住。
+        store.kickoff_tactic_started_at = context.now
         _enter_kickoff_state(store, KickoffTacticState.ALIGN_PASSER, context.now)
         state = KickoffTacticState.ALIGN_PASSER
+        state_entered_at = context.now
+
+    tactic_started_at = getattr(store, "kickoff_tactic_started_at", None)
+    if tactic_started_at is not None and (
+        context.now - tactic_started_at > KICKOFF_TOTAL_TIMEOUT_SEC
+    ):
+        _abort_kickoff_tactic(context, store, "total_timeout")
+        state = getattr(store, "kickoff_tactic_state")
 
     if state == KickoffTacticState.ALIGN_PASSER:
         ball = context.ball

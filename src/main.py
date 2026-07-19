@@ -46,7 +46,7 @@ class Phase(Enum):
     """比赛阶段。顶层状态机,决定当前是正常拼抢/开球/定位球/准备/停止。"""
     NORMAL = "normal"              # PLAYING 正常拼抢
     OUR_KICKOFF = "our_kickoff"    # 我方开球(SET+PLAYING 初期,take_kickoff)
-    OPP_KICKOFF = "opp_kickoff"    # 对方开球(避让)
+    OPP_KICKOFF = "opp_kickoff"    # 对方开球(球动前等待)
     OUR_SET_PLAY = "our_set_play"  # 我方定位球(任意球/角球/球门球)
     OPP_SET_PLAY = "opp_set_play"  # 对方定位球(避让)
     READY = "ready"                # READY 走位
@@ -145,14 +145,24 @@ def get_phase(context: Context) -> Phase:
             our_team = context.team_id
             if g.kicking_team == our_team:
                 return Phase.OUR_KICKOFF
-            else:
-                return Phase.OPP_KICKOFF
+            if _kickoff_ball_has_moved(context):
+                return Phase.NORMAL
+            return Phase.OPP_KICKOFF
 
         # 正常拼抢
         return Phase.NORMAL
 
     # SET / INITIAL / FINISHED:站定
     return Phase.STOPPED
+
+
+def _kickoff_ball_has_moved(context: Context) -> bool:
+    """对方开球约束解除条件：球离开中点后，我方才恢复移动。"""
+    ball = context.ball
+    if ball is None:
+        return False
+    return dist(ball.x, ball.y, 0.0, 0.0) >= CENTER_LEAVE_DIST_M
+
 
 def get_set_play_type(context: Context) -> SetPlay:
     """当前生效的定位球类型;无定位球(或无裁判机数据)时返回 ``SetPlay.NONE``。
@@ -992,6 +1002,43 @@ def _ball_in_own_danger_area(context: Context) -> bool:
         <= own_goal_line_x + OPEN_PLAY_IMMEDIATE_GOAL_DANGER_DEPTH_M
     )
     return in_penalty_channel or immediately_near_goal
+
+
+def _ball_in_single_player_guard_area(context: Context) -> bool:
+    """判断单机器人降级时球是否仍值得优先守门。"""
+    ball = context.ball
+    if ball is None:
+        return True
+
+    own_goal_line_x = -context.field.length / 2.0
+    own_penalty_edge_x = own_goal_line_x + context.field.penalty_area_length
+    danger_half_width = (
+        context.field.penalty_area_width / 2.0
+        + OPEN_PLAY_DANGER_LATERAL_MARGIN_M
+    )
+    return (
+        ball.x <= own_penalty_edge_x
+        and abs(ball.y) <= danger_half_width
+    )
+
+
+def _should_single_player_guard(context: Context, player: Player) -> bool:
+    """单台 available 时，在门前风险仍高时守门，否则允许普通追球。"""
+    pose = player.pose
+    if pose is None or context.ball is None:
+        return True
+    if _ball_in_single_player_guard_area(context):
+        return True
+
+    own_goal_x, own_goal_y = own_goal(context)
+    goalkeeper_protection_radius = (
+        context.field.penalty_area_length
+        + SINGLE_PLAYER_GOAL_PROTECTION_MARGIN_M
+    )
+    return (
+        dist(pose.x, pose.y, own_goal_x, own_goal_y)
+        <= goalkeeper_protection_radius
+    )
 
 
 def _ball_in_deep_defensive_danger(
@@ -2976,20 +3023,28 @@ def _act_normal(
         and role_goalkeeper is not None
         and primary_attacker is None
     ):
-        # 唯一可用者既然承担守门身份，就不再降级为普通 primary attacker。
-        _act_goalkeeper_guard(
-            context,
-            role_goalkeeper,
-            assigned_field_players,
-            store,
-            allow_active_response=True,
-        )
-        if deep_defense_active:
-            _act_deep_defense(
+        # 唯一可用者在门前风险高时守门；球远离己方门且自身不在门前保护位时，
+        # 释放为普通处理球入口，避免少人状态下整队只留守不追球。
+        if _should_single_player_guard(context, role_goalkeeper):
+            _act_goalkeeper_guard(
                 context,
                 role_goalkeeper,
                 assigned_field_players,
                 store,
+                allow_active_response=True,
+            )
+            if deep_defense_active:
+                _act_deep_defense(
+                    context,
+                    role_goalkeeper,
+                    assigned_field_players,
+                    store,
+                )
+        else:
+            store.normal_attacker = role_goalkeeper.id
+            _act_attack_ball_handler(
+                role_goalkeeper,
+                "single_degraded",
             )
         return
 
@@ -3330,37 +3385,16 @@ def _act_opp_kickoff(
     players: list[Player],
     goalkeeper: Player | None,
 ) -> None:
-    """对方中场开球:守门并在中圈、球的合法距离外等待。"""
+    """对方中场开球:PLAYING 后先完全静止，直到球离开中点。"""
     if not players:
         return
 
-    if goalkeeper is not None:
-        _walk_to_restart_target(
-            context,
-            goalkeeper,
-            own_goal_area_center(context),
-            "opp_kickoff:guard",
-            stay_outside_center_circle=True,
+    for player in players:
+        player.action = (
+            "opp_kickoff:wait_guard"
+            if player is goalkeeper else "opp_kickoff:wait_touch"
         )
-
-    waiting_players = [
-        player for player in players if player is not goalkeeper
-    ]
-    center_clearance = context.field.circle_radius + CIRCLE_MARGIN_M
-    waiting_slots = [
-        (-center_clearance - 0.4, 0.0),
-        (-center_clearance - 1.2, 1.0),
-        (-center_clearance - 1.2, -1.0),
-    ]
-    for slot_index, player in enumerate(waiting_players):
-        target = waiting_slots[slot_index % len(waiting_slots)]
-        _walk_to_restart_target(
-            context,
-            player,
-            target,
-            "opp_kickoff:avoid",
-            stay_outside_center_circle=True,
-        )
+        player.stop()
 
 
 def _act_our_set_play(

@@ -53,6 +53,14 @@ class Phase(Enum):
     STOPPED = "stopped"            # SET(非开球重开) / INITIAL / FINISHED / stopped
 
 
+class OpenPlayMode(Enum):
+    """普通比赛的稳定战术模式。"""
+
+    ATTACKING = "attacking"
+    DEFENDING = "defending"
+    CONTESTED = "contested"
+
+
 class OpenPlayAvailability(Enum):
     """普通比赛角色分配可使用的机器人数量。"""
 
@@ -71,6 +79,18 @@ class OpenPlayRoleAssignment:
     front_partner_id: int | None
     available_player_ids: tuple[int, ...]
     availability: OpenPlayAvailability
+
+
+@dataclass(frozen=True)
+class OpenPlayModeEstimate:
+    """一帧普通比赛的可解释模式估计结果。"""
+
+    candidate_mode: OpenPlayMode
+    reason: str
+    our_nearest_ball_distance: float | None
+    opponent_nearest_ball_distance: float | None
+    distance_advantage: float | None
+    ball_in_own_danger_area: bool
 
 
 def get_phase(context: Context) -> Phase:
@@ -155,6 +175,14 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.ball_visible_frames = 0
         store.ball_searcher = None
         store.ball_lost_since = None
+        store.open_play_mode = None
+        store.open_play_mode_entered_at = None
+        store.open_play_last_switch_at = None
+        store.open_play_mode_reason = "inactive"
+        store.open_play_last_switch_reason = None
+        store.open_play_our_ball_distance = None
+        store.open_play_opponent_ball_distance = None
+        store.open_play_distance_advantage = None
         store.player_availability = {}
         store.available_player_ids = ()
         store.default_goalkeeper_id = None
@@ -360,6 +388,14 @@ def _clear_normal_sticky(store) -> None:
     store.ball_visible_frames = 0
     store.ball_searcher = None
     store.ball_lost_since = None
+    store.open_play_mode = None
+    store.open_play_mode_entered_at = None
+    store.open_play_last_switch_at = None
+    store.open_play_mode_reason = "inactive"
+    store.open_play_last_switch_reason = None
+    store.open_play_our_ball_distance = None
+    store.open_play_opponent_ball_distance = None
+    store.open_play_distance_advantage = None
 
 
 def _player_dist_to_ball(context: Context, p: Player) -> float:
@@ -750,10 +786,208 @@ def _act_normal_attacking_shape(
     )
 
 
-def _should_enter_normal_defense(context: Context) -> bool:
-    """只在已知球明确进入己方半场时启用普通比赛防守阵型。"""
+def _nearest_available_teammate_distance(
+    context: Context,
+    field_players: list[Player],
+) -> float | None:
+    """返回可用非守门员到球的最近距离。"""
     ball = context.ball
-    return ball is not None and ball.x < NORMAL_DEFENSE_BALL_X_MAX_M
+    player_distances = [
+        dist(player.pose.x, player.pose.y, ball.x, ball.y)
+        for player in field_players
+        if ball is not None and player.pose is not None
+    ]
+    return min(player_distances) if player_distances else None
+
+
+def _nearest_opponent_distance(context: Context) -> float | None:
+    """返回具有有效位姿的对方机器人到球的最近距离。"""
+    ball = context.ball
+    opponent_distances = [
+        dist(robot.pose.x, robot.pose.y, ball.x, ball.y)
+        for robot in context.opponents.values()
+        if ball is not None and robot.pose is not None
+    ]
+    return min(opponent_distances) if opponent_distances else None
+
+
+def _ball_in_own_danger_area(context: Context) -> bool:
+    """判断球是否位于可立即打断模式迟滞的己方门前危险区。"""
+    ball = context.ball
+    if ball is None:
+        return False
+
+    own_goal_line_x = -context.field.length / 2.0
+    own_penalty_edge_x = own_goal_line_x + context.field.penalty_area_length
+    danger_front_x = max(OPEN_PLAY_DANGER_X_M, own_penalty_edge_x)
+    danger_half_width = (
+        context.field.penalty_area_width / 2.0
+        + OPEN_PLAY_DANGER_LATERAL_MARGIN_M
+    )
+    in_penalty_channel = (
+        ball.x <= danger_front_x
+        and abs(ball.y) <= danger_half_width
+    )
+    immediately_near_goal = (
+        ball.x
+        <= own_goal_line_x + OPEN_PLAY_IMMEDIATE_GOAL_DANGER_DEPTH_M
+    )
+    return in_penalty_channel or immediately_near_goal
+
+
+def _estimate_open_play_mode(
+    context: Context,
+    field_players: list[Player],
+    previous_mode: OpenPlayMode | None,
+) -> OpenPlayModeEstimate:
+    """综合门前危险、双方到球距离和球场区域估计普通比赛模式。"""
+    ball = context.ball
+    our_nearest_distance = _nearest_available_teammate_distance(
+        context, field_players,
+    )
+    opponent_nearest_distance = _nearest_opponent_distance(context)
+    distance_advantage = (
+        opponent_nearest_distance - our_nearest_distance
+        if our_nearest_distance is not None
+        and opponent_nearest_distance is not None
+        else None
+    )
+    ball_in_danger_area = _ball_in_own_danger_area(context)
+
+    if ball_in_danger_area:
+        candidate_mode = OpenPlayMode.DEFENDING
+        reason = "own_danger_area"
+    elif distance_advantage is not None:
+        if distance_advantage >= OPEN_PLAY_ATTACK_DISTANCE_ADVANTAGE_M:
+            candidate_mode = OpenPlayMode.ATTACKING
+            reason = "own_distance_advantage"
+        elif distance_advantage <= -OPEN_PLAY_DEFENSE_DISTANCE_ADVANTAGE_M:
+            candidate_mode = OpenPlayMode.DEFENDING
+            reason = "opponent_distance_advantage"
+        elif abs(distance_advantage) <= OPEN_PLAY_CONTESTED_DISTANCE_BAND_M:
+            candidate_mode = OpenPlayMode.CONTESTED
+            reason = "balanced_ball_distance"
+        elif ball is not None and ball.x >= OPEN_PLAY_CONTESTED_BAND_M:
+            candidate_mode = OpenPlayMode.ATTACKING
+            reason = "opponent_half_no_clear_opponent_advantage"
+        elif previous_mode is not None:
+            candidate_mode = previous_mode
+            reason = "hold_hysteresis"
+        else:
+            candidate_mode = OpenPlayMode.CONTESTED
+            reason = "uncertain_distance_advantage"
+    elif our_nearest_distance is not None:
+        if ball is not None and ball.x >= -OPEN_PLAY_CONTESTED_BAND_M:
+            candidate_mode = OpenPlayMode.ATTACKING
+            reason = "opponent_data_missing_safe_ball"
+        else:
+            candidate_mode = OpenPlayMode.CONTESTED
+            reason = "opponent_data_missing_backfield"
+    elif opponent_nearest_distance is not None:
+        candidate_mode = OpenPlayMode.DEFENDING
+        reason = "no_available_field_player"
+    else:
+        candidate_mode = OpenPlayMode.CONTESTED
+        reason = "insufficient_pose_data"
+
+    return OpenPlayModeEstimate(
+        candidate_mode=candidate_mode,
+        reason=reason,
+        our_nearest_ball_distance=our_nearest_distance,
+        opponent_nearest_ball_distance=opponent_nearest_distance,
+        distance_advantage=distance_advantage,
+        ball_in_own_danger_area=ball_in_danger_area,
+    )
+
+
+def _update_open_play_mode(
+    context: Context,
+    estimate: OpenPlayModeEstimate,
+    store,
+) -> OpenPlayMode:
+    """应用最短保持和危险区抢占，返回本帧稳定战术模式。"""
+    current_mode = getattr(store, "open_play_mode", None)
+    mode_entered_at = getattr(store, "open_play_mode_entered_at", None)
+
+    store.open_play_our_ball_distance = estimate.our_nearest_ball_distance
+    store.open_play_opponent_ball_distance = (
+        estimate.opponent_nearest_ball_distance
+    )
+    store.open_play_distance_advantage = estimate.distance_advantage
+
+    danger_forces_defense = (
+        estimate.ball_in_own_danger_area
+        and estimate.candidate_mode == OpenPlayMode.DEFENDING
+    )
+    mode_has_been_held_long_enough = (
+        mode_entered_at is None
+        or context.now - mode_entered_at >= OPEN_PLAY_MODE_MIN_HOLD_SEC
+    )
+    should_switch = (
+        current_mode is None
+        or (
+            estimate.candidate_mode != current_mode
+            and (danger_forces_defense or mode_has_been_held_long_enough)
+        )
+    )
+
+    if should_switch:
+        previous_mode = current_mode
+        current_mode = estimate.candidate_mode
+        store.open_play_mode = current_mode
+        store.open_play_mode_entered_at = context.now
+        store.open_play_last_switch_at = context.now
+        store.open_play_mode_reason = estimate.reason
+        store.open_play_last_switch_reason = estimate.reason
+        _log.info(
+            "open play mode %s -> %s reason=%s our_distance=%s "
+            "opponent_distance=%s advantage=%s",
+            previous_mode.value if previous_mode is not None else "none",
+            current_mode.value,
+            estimate.reason,
+            estimate.our_nearest_ball_distance,
+            estimate.opponent_nearest_ball_distance,
+            estimate.distance_advantage,
+        )
+    elif estimate.candidate_mode == current_mode:
+        store.open_play_mode_reason = estimate.reason
+    else:
+        store.open_play_mode_reason = "hold_hysteresis"
+
+    return current_mode
+
+
+def _format_open_play_distance(distance: float | None) -> str:
+    return "n/a" if distance is None else f"{distance:.2f}"
+
+
+def _draw_open_play_mode(context: Context, store) -> None:
+    """在场外显示当前模式、原因和双方最近到球距离。"""
+    from .framework import debugdraw
+
+    mode = getattr(store, "open_play_mode", None)
+    if mode is None:
+        return
+    reason = getattr(store, "open_play_mode_reason", "unknown")
+    our_distance = _format_open_play_distance(
+        getattr(store, "open_play_our_ball_distance", None),
+    )
+    opponent_distance = _format_open_play_distance(
+        getattr(store, "open_play_opponent_ball_distance", None),
+    )
+    advantage = _format_open_play_distance(
+        getattr(store, "open_play_distance_advantage", None),
+    )
+    debugdraw.text(
+        0.0,
+        context.field.width / 2.0 + 0.55,
+        (
+            f"mode={mode.value} mode_reason={reason} "
+            f"our={our_distance} opp={opponent_distance} adv={advantage}"
+        ),
+        rgb=(0.4, 1.0, 1.0),
+        ns="open_play_mode",
+    )
 
 
 def _should_single_player_guard(context: Context, player: Player) -> bool:
@@ -891,6 +1125,38 @@ def _act_normal_defense(
         protect_player.action = "defense:protect"
 
 
+def _act_normal_contested_shape(
+    context: Context,
+    goalkeeper: Player | None,
+    challenge_player: Player | None,
+    protect_player: Player | None,
+    store,
+) -> None:
+    """执行争议球安全结构：一人处理球，另一人保护球门方向中路。"""
+    if goalkeeper is not None:
+        goalkeeper.guard()
+        goalkeeper_kind = (
+            "temporary"
+            if goalkeeper.id == getattr(
+                store, "temporary_goalkeeper_id", None,
+            )
+            else "default"
+        )
+        goalkeeper.action = f"contested:goalkeeper:{goalkeeper_kind}"
+
+    if challenge_player is not None:
+        _act_normal_defense_pressure(context, challenge_player)
+        challenge_subaction = challenge_player.action.removeprefix(
+            "defense:pressure:",
+        )
+        challenge_player.action = f"contested:challenge:{challenge_subaction}"
+
+    if protect_player is not None:
+        protect_target = _get_normal_defense_protect_target(context)
+        protect_player.move_to_position(protect_target)
+        protect_player.action = "contested:protect"
+
+
 def _act_normal(
     context: Context,
     players: list[Player],
@@ -899,7 +1165,7 @@ def _act_normal(
     *,
     allow_ball_search: bool = True,
 ) -> None:
-    """NORMAL:分派守门、T04 防守或 T05 双前场进攻动作。
+    """NORMAL:稳定选择进攻、防守或争议球结构后执行对应动作。
 
     固定战术未来可在调用本入口前独立分派,从而绕过普通比赛角色分配。
     """
@@ -954,25 +1220,57 @@ def _act_normal(
                 player.stop()
         return
 
-    if allow_ball_search and _should_enter_normal_defense(context):
-        _act_normal_defense(
-            context,
-            role_goalkeeper,
-            primary_attacker,
-            front_partner,
-            store,
-        )
+    if not allow_ball_search:
+        # OUR_SET_PLAY 暂时复用该入口，但固定战术不进入普通比赛三态。
+        if role_goalkeeper is not None:
+            _act_goalkeeper_guard(role_goalkeeper, store)
+        if primary_attacker is not None:
+            _act_normal_primary_attacker(primary_attacker)
+        if front_partner is not None:
+            _act_normal_front_partner(front_partner)
         return
 
+    mode_estimate = _estimate_open_play_mode(
+        context,
+        assigned_field_players,
+        getattr(store, "open_play_mode", None),
+    )
+    open_play_mode = _update_open_play_mode(
+        context, mode_estimate, store,
+    )
+    _draw_open_play_mode(context, store)
+
+    challenge_player = primary_attacker
+    protect_player = front_partner
     if (
-        allow_ball_search
-        and assignment.availability == OpenPlayAvailability.DEGRADED_ONE
+        open_play_mode in (OpenPlayMode.DEFENDING, OpenPlayMode.CONTESTED)
+        and assigned_field_players
+    ):
+        challenge_player = min(
+            assigned_field_players,
+            key=lambda player: _player_dist_to_ball(context, player),
+        )
+        protect_player = next(
+            (
+                player for player in assigned_field_players
+                if player is not challenge_player
+            ),
+            None,
+        )
+        store.normal_attacker = challenge_player.id
+
+    if (
+        assignment.availability == OpenPlayAvailability.DEGRADED_ONE
         and role_goalkeeper is not None
         and primary_attacker is None
     ):
-        if _should_single_player_guard(context, role_goalkeeper):
-            _act_goalkeeper_guard(role_goalkeeper, store)
-        else:
+        single_player_must_guard = _should_single_player_guard(
+            context, role_goalkeeper,
+        )
+        if (
+            open_play_mode == OpenPlayMode.ATTACKING
+            and not single_player_must_guard
+        ):
             # 保留 T02 的单人远离己方门时处理球降级，不改变守门员身份状态。
             _act_normal_attacking_shape(
                 context,
@@ -981,9 +1279,22 @@ def _act_normal(
                 None,
                 store,
             )
+        elif (
+            open_play_mode == OpenPlayMode.CONTESTED
+            and not single_player_must_guard
+        ):
+            _act_normal_contested_shape(
+                context,
+                None,
+                role_goalkeeper,
+                None,
+                store,
+            )
+        else:
+            _act_goalkeeper_guard(role_goalkeeper, store)
         return
 
-    if allow_ball_search:
+    if open_play_mode == OpenPlayMode.ATTACKING:
         _act_normal_attacking_shape(
             context,
             role_goalkeeper,
@@ -992,15 +1303,23 @@ def _act_normal(
             store,
         )
         return
+    if open_play_mode == OpenPlayMode.DEFENDING:
+        _act_normal_defense(
+            context,
+            role_goalkeeper,
+            challenge_player,
+            protect_player,
+            store,
+        )
+        return
 
-    # OUR_SET_PLAY reuses this entry point with ball search disabled. Keep its
-    # existing non-T05 fallback until dedicated restart tactics are added.
-    if role_goalkeeper is not None:
-        _act_goalkeeper_guard(role_goalkeeper, store)
-    if primary_attacker is not None:
-        _act_normal_primary_attacker(primary_attacker)
-    if front_partner is not None:
-        _act_normal_front_partner(front_partner)
+    _act_normal_contested_shape(
+        context,
+        role_goalkeeper,
+        challenge_player,
+        protect_player,
+        store,
+    )
 
 
 def _act_goalkeeper_guard(goalkeeper: Player, store) -> None:

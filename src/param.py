@@ -81,6 +81,8 @@ SUPPORT_DIST_M = 3.0
 # Normal 阶段策略
 # ======================================================================
 
+DEFAULT_GOALKEEPER_ID = 1  # 裁判守门员字段无效时的稳定回退编号
+
 ATTACKER_KEEP_DIST_MARGIN_M = 0.3  # 防止 Attacker 选择产生震荡
 
 FALLEN_COST = 10.0  # 摔倒球员的距离惩罚值(米)

@@ -134,6 +134,13 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.ball_visible_frames = 0
         store.ball_searcher = None
         store.ball_lost_since = None
+        store.player_availability = {}
+        store.available_player_ids = ()
+        store.default_goalkeeper_id = None
+        store.temporary_goalkeeper_id = None
+        store.current_goalkeeper_id = None
+        store.available_field_player_ids = ()
+        store.can_run_two_player_tactic = False
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -156,52 +163,162 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
 
-        # 活性自理 + 过滤出本帧可行动的球员。
-        # ensure_ready:摔倒起身 / 切 walk 模式(异步,不产生移动);被罚下的也做,
-        # 这样解罚后能立刻投入。被罚下或未就绪的不参与分派(也不进角色分配,避免把
-        # 动不了的人选成 attacker 导致该帧无人进攻)。
-        active: list[Player] = []
-        for p in players:
-            ready = p.ensure_ready()
-            if p.is_penalized:
-                p.action = "penalized"     # 罚下:可起身/切模式,但不能移动
-                p.stop()
-            elif not ready:
-                p.action = "fallen" if p.is_fallen else "switching_mode"
-            elif p.pose is None:
-                p.action = "no_pose"       # 自己位置未知:不参与分派(下游按 pose 已知处理)
-                p.stop()
-            else:
-                active.append(p)
+        available_players = _collect_available_players(players, store)
+        current_goalkeeper = _select_current_goalkeeper(
+            context,
+            players,
+            available_players,
+            phase,
+            store,
+        )
 
         # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
         if phase == Phase.NORMAL:
-            _act_normal(context, active, store)
+            _act_normal(context, available_players, current_goalkeeper, store)
         elif phase == Phase.OUR_KICKOFF:
             _clear_normal_sticky(store)
-            _act_our_kickoff(context, active, store)
+            _act_our_kickoff(
+                context, available_players, current_goalkeeper, store,
+            )
         elif phase == Phase.OPP_KICKOFF:
             _clear_normal_sticky(store)
-            _act_opp_kickoff(context, active)
+            _act_opp_kickoff(context, available_players, current_goalkeeper)
         elif phase == Phase.OUR_SET_PLAY:
             _clear_normal_sticky(store)
-            _act_our_set_play(context, active, store)
+            _act_our_set_play(
+                context, available_players, current_goalkeeper, store,
+            )
         elif phase == Phase.OPP_SET_PLAY:
             _clear_normal_sticky(store)
-            _act_opp_set_play(context, active, store)
+            _act_opp_set_play(
+                context, available_players, current_goalkeeper, store,
+            )
         elif phase == Phase.READY:
             _clear_normal_sticky(store)
-            _act_ready(context, active)
+            _act_ready(context, available_players, current_goalkeeper, store)
         elif phase == Phase.STOPPED:
             _clear_normal_sticky(store)
-            for p in active:
-                p.action = "stopped"
-                p.stop()
+            for player in available_players:
+                player.action = "stopped"
+                player.stop()
 
         # 队员可视化统一在最后画一遍:覆盖所有球员(含判罚/未就绪/STOPPED),
         # 修复 SET 等状态下红球/标签消失的问题。
         for p in players:
             _draw_teammate_marker(p)
+
+
+def _collect_available_players(players: list[Player], store) -> list[Player]:
+    """统一分类每帧可用性,并清除不可用球员的旧动作命令。"""
+    player_availability: dict[int, str] = {}
+    available_players: list[Player] = []
+
+    for player in players:
+        ready = player.ensure_ready()
+        if player.is_penalized:
+            availability = "penalized"
+        elif player.is_fallen:
+            availability = "fallen"
+        elif not ready:
+            availability = "switching_mode"
+        elif player.pose is None:
+            availability = "no_pose"
+        else:
+            availability = "available"
+
+        player_availability[player.id] = availability
+        player.action = availability
+        if availability == "available":
+            available_players.append(player)
+        else:
+            player.stop()
+
+    store.player_availability = player_availability
+    store.available_player_ids = tuple(
+        player.id for player in available_players
+    )
+    return available_players
+
+
+def _resolve_default_goalkeeper_id(
+    context: Context,
+    players: list[Player],
+) -> int | None:
+    """解析裁判指定的默认守门员,无效时使用稳定 roster 回退。"""
+    roster_ids = {player.id for player in players}
+    if not roster_ids:
+        return None
+
+    team_state = (
+        context.game.get_team_state(context.team_id)
+        if context.game is not None else None
+    )
+    referee_goalkeeper_id = (
+        team_state.goalkeeper if team_state is not None else 0
+    )
+    if referee_goalkeeper_id > 0 and referee_goalkeeper_id in roster_ids:
+        return referee_goalkeeper_id
+    if DEFAULT_GOALKEEPER_ID in roster_ids:
+        return DEFAULT_GOALKEEPER_ID
+    return min(roster_ids)
+
+
+def _select_current_goalkeeper(
+    context: Context,
+    all_players: list[Player],
+    available_players: list[Player],
+    phase: Phase,
+    store,
+) -> Player | None:
+    """选择并保持当前守门员,只在安全窗口交还默认守门员职责。"""
+    default_goalkeeper_id = _resolve_default_goalkeeper_id(context, all_players)
+    store.default_goalkeeper_id = default_goalkeeper_id
+
+    available_by_id = {
+        player.id: player for player in available_players
+    }
+    default_goalkeeper = available_by_id.get(default_goalkeeper_id)
+    temporary_goalkeeper_id = getattr(
+        store, "temporary_goalkeeper_id", None,
+    )
+
+    safe_handover_window = phase in (Phase.READY, Phase.STOPPED)
+    if safe_handover_window and default_goalkeeper is not None:
+        temporary_goalkeeper_id = None
+
+    temporary_goalkeeper = available_by_id.get(temporary_goalkeeper_id)
+    if temporary_goalkeeper is None:
+        temporary_goalkeeper_id = None
+
+    if temporary_goalkeeper is not None:
+        current_goalkeeper = temporary_goalkeeper
+    elif default_goalkeeper is not None:
+        current_goalkeeper = default_goalkeeper
+    elif available_players:
+        own_goal_x, own_goal_y = own_goal(context)
+        current_goalkeeper = min(
+            available_players,
+            key=lambda player: dist(
+                player.pose.x, player.pose.y, own_goal_x, own_goal_y,
+            ),
+        )
+        temporary_goalkeeper_id = current_goalkeeper.id
+    else:
+        current_goalkeeper = None
+
+    store.temporary_goalkeeper_id = temporary_goalkeeper_id
+    store.current_goalkeeper_id = (
+        current_goalkeeper.id if current_goalkeeper is not None else None
+    )
+    field_players = [
+        player for player in available_players
+        if player is not current_goalkeeper
+    ]
+    store.available_field_player_ids = tuple(
+        player.id for player in field_players
+    )
+    store.can_run_two_player_tactic = len(field_players) >= 2
+    return current_goalkeeper
 
 
 def _clear_normal_sticky(store) -> None:
@@ -249,16 +366,29 @@ def _select_closest_attacker(
 def _act_normal(
     context: Context,
     players: list[Player],
+    goalkeeper: Player | None,
     store,
     *,
     allow_ball_search: bool = True,
 ) -> None:
-    """NORMAL:距球最近者 attack,剩下人里离己方门最近者 guard,其余 support。
+    """NORMAL:当前守门员守门,场上球员沿用 attacker/support 入口。
 
     ``players`` 是本帧可行动球员(已就绪、pose 已知),这里直接挑角色并执行。
     """
     if not players:
         return
+
+    role_goalkeeper = goalkeeper
+    field_players = [
+        player for player in players if player is not role_goalkeeper
+    ]
+    if len(players) == 1:
+        only_player = players[0]
+        if _should_single_player_guard(context, only_player):
+            _act_goalkeeper_guard(only_player, store)
+            return
+        role_goalkeeper = None
+        field_players = [only_player]
 
     ball_confirmed = (
         _update_ball_recovery_state(context, store)
@@ -266,32 +396,62 @@ def _act_normal(
     )
     if not ball_confirmed:
         if allow_ball_search:
-            _act_ball_recovery(context, players, store)
+            _act_ball_recovery(
+                context, field_players, role_goalkeeper, store,
+            )
         else:
-            for player in players:
+            if role_goalkeeper is not None:
+                _act_goalkeeper_guard(role_goalkeeper, store)
+            for player in field_players:
                 player.action = "ball_unknown:stop"
                 player.stop()
         return
 
+    if role_goalkeeper is not None:
+        _act_goalkeeper_guard(role_goalkeeper, store)
+    if not field_players:
+        return
+
     attacker = _select_closest_attacker(
-        context, players, getattr(store, "normal_attacker", None),
+        context, field_players, getattr(store, "normal_attacker", None),
     )
     store.normal_attacker = attacker.id
     attacker.action = "attack"
     attacker.attack()
 
-    # guard:剩下人里离己方门最近者(如还有人)
-    rest = [p for p in players if p is not attacker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-        guard.guard()  
-        rest = [p for p in rest if p is not guard]
+    for player in field_players:
+        if player is attacker:
+            continue
+        player.action = "support"
+        player.support()
 
-    # support:其余全部
-    for p in rest:
-        p.action = "support"
-        p.support()
+
+def _act_goalkeeper_guard(goalkeeper: Player, store) -> None:
+    """执行现有守门动作,并保留默认或临时守门员身份标签。"""
+    goalkeeper.guard()
+    if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None):
+        goalkeeper.action = "temp_goalkeeper:guard"
+    else:
+        goalkeeper.action = "goalkeeper:guard"
+
+
+def _should_single_player_guard(context: Context, player: Player) -> bool:
+    """单人降级时,球门危险或机器人已在门前则优先守门。"""
+    ball = context.ball
+    if ball is None:
+        return True
+
+    own_penalty_edge_x = (
+        -context.field.length / 2.0 + context.field.penalty_area_length
+    )
+    if ball.x <= own_penalty_edge_x:
+        return True
+
+    own_goal_x, own_goal_y = own_goal(context)
+    goal_protection_distance = context.field.penalty_area_length + 0.5
+    return dist(
+        player.pose.x, player.pose.y, own_goal_x, own_goal_y,
+    ) <= goal_protection_distance
 
 
 def _update_ball_recovery_state(context: Context, store) -> bool:
@@ -317,18 +477,28 @@ def _update_ball_recovery_state(context: Context, store) -> bool:
     return True
 
 
-def _act_ball_recovery(context: Context, players: list[Player], store) -> None:
+def _act_ball_recovery(
+    context: Context,
+    field_players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
     """NORMAL 丢球恢复:一人定向扫场,其余保持守位或停止。"""
-    active_ids = {player.id for player in players}
+    if goalkeeper is not None:
+        _act_goalkeeper_guard(goalkeeper, store)
+    if not field_players:
+        return
+
+    active_ids = {player.id for player in field_players}
     preferred_searcher = getattr(store, "ball_searcher", None)
     if preferred_searcher not in active_ids:
         preferred_searcher = getattr(store, "normal_attacker", None)
     if preferred_searcher not in active_ids:
-        preferred_searcher = min(player.id for player in players)
+        preferred_searcher = min(player.id for player in field_players)
     store.ball_searcher = preferred_searcher
 
     searcher = next(
-        player for player in players if player.id == preferred_searcher
+        player for player in field_players if player.id == preferred_searcher
     )
     last_ball_position = getattr(store, "last_ball_position", None)
     last_ball_seen_at = getattr(store, "last_ball_seen_at", None)
@@ -355,51 +525,55 @@ def _act_ball_recovery(context: Context, players: list[Player], store) -> None:
     )
     searcher.search_for_ball(search_target, sweep_direction)
 
-    rest = [player for player in players if player is not searcher]
-    if rest:
-        goal_x, goal_y = own_goal(context)
-        guard = min(
-            rest,
-            key=lambda player: dist(
-                player.pose.x, player.pose.y, goal_x, goal_y,
-            ),
-        )
-        guard.guard()
-        rest = [player for player in rest if player is not guard]
-
-    for player in rest:
+    for player in field_players:
+        if player is searcher:
+            continue
         player.action = "ball_unknown:hold"
         player.stop()
 
 
-def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """OUR_KICKOFF:锁定距离最小者开球,剩下人里离己方门最近者 guard,其余 support。"""
+def _act_our_kickoff(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
+    """OUR_KICKOFF:守门员留守,场上球员沿用现有开球入口。"""
     if not players:
         return
 
-    active_ids = {p.id for p in players}
+    if goalkeeper is not None:
+        _act_goalkeeper_guard(goalkeeper, store)
+    field_players = [
+        player for player in players if player is not goalkeeper
+    ]
+    if not field_players:
+        store.kickoff_taker = None
+        return
+
+    active_ids = {player.id for player in field_players}
     if store.prev_phase != Phase.OUR_KICKOFF or store.kickoff_taker not in active_ids:
         # 进入开球阶段，重新选择开球球员
-        store.kickoff_taker = _select_closest_attacker(context, players).id
+        store.kickoff_taker = _select_closest_attacker(
+            context, field_players,
+        ).id
 
     attacker_id = store.kickoff_taker
-    attacker = next((p for p in players if p.id == attacker_id), None)
+    attacker = next(
+        (player for player in field_players if player.id == attacker_id),
+        None,
+    )
     if attacker is None:
         return
 
     attacker.action = "kickoff"
     attacker.kick(0.1, KICK_POWER_OUR_KICKOFF)
 
-    rest = [p for p in players if p is not attacker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-        guard.guard()
-        rest = [p for p in rest if p is not guard]
-
-    for p in rest:
-        p.action = "stay"
-        p.stop()
+    for player in field_players:
+        if player is attacker:
+            continue
+        player.action = "stay"
+        player.stop()
 
 
 def _clamp_restart_target(
@@ -508,30 +682,27 @@ def _walk_to_restart_target(
     )
 
 
-def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
+def _act_opp_kickoff(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+) -> None:
     """对方中场开球:守门并在中圈、球的合法距离外等待。"""
     if not players:
         return
 
-    own_goal_x, own_goal_y = own_goal(context)
-    guard = min(
-        players,
-        key=lambda player: dist(
-            player.pose.x,
-            player.pose.y,
-            own_goal_x,
-            own_goal_y,
-        ),
-    )
-    _walk_to_restart_target(
-        context,
-        guard,
-        own_goal_area_center(context),
-        "opp_kickoff:guard",
-        stay_outside_center_circle=True,
-    )
+    if goalkeeper is not None:
+        _walk_to_restart_target(
+            context,
+            goalkeeper,
+            own_goal_area_center(context),
+            "opp_kickoff:guard",
+            stay_outside_center_circle=True,
+        )
 
-    waiting_players = [player for player in players if player is not guard]
+    waiting_players = [
+        player for player in players if player is not goalkeeper
+    ]
     center_clearance = context.field.circle_radius + CIRCLE_MARGIN_M
     waiting_slots = [
         (-center_clearance - 0.4, 0.0),
@@ -549,44 +720,64 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
         )
 
 
-def _act_our_set_play(context: Context, players: list[Player], store) -> None:
+def _act_our_set_play(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
     """OUR_SET_PLAY:按定位球类型分派, TODO：加入自己的逻辑。默认为 _act_normal"""
+    field_players = [
+        player for player in players if player is not goalkeeper
+    ]
+    if not field_players:
+        if goalkeeper is not None:
+            _act_goalkeeper_guard(goalkeeper, store)
+        return
+
     set_play = get_set_play_type(context)
     if set_play == SetPlay.THROW_IN:
-        _act_normal(context, players, store, allow_ball_search=False)
+        _act_normal(
+            context, players, goalkeeper, store, allow_ball_search=False,
+        )
         return
     if set_play == SetPlay.CORNER_KICK:
-        _act_normal(context, players, store, allow_ball_search=False)
+        _act_normal(
+            context, players, goalkeeper, store, allow_ball_search=False,
+        )
         return
     if set_play == SetPlay.GOAL_KICK:
-        _act_normal(context, players, store, allow_ball_search=False)
+        _act_normal(
+            context, players, goalkeeper, store, allow_ball_search=False,
+        )
         return
-    _act_normal(context, players, store, allow_ball_search=False)
+    _act_normal(
+        context, players, goalkeeper, store, allow_ball_search=False,
+    )
 
 
-def _act_opp_set_play(context: Context, players: list[Player], _store) -> None:
+def _act_opp_set_play(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    _store,
+) -> None:
     """对方定位球:守门、封堵和保护均在球的合法距离外执行。"""
     if not players:
         return
 
     own_goal_x, own_goal_y = own_goal(context)
-    guard = min(
-        players,
-        key=lambda player: dist(
-            player.pose.x,
-            player.pose.y,
-            own_goal_x,
-            own_goal_y,
-        ),
-    )
-    _walk_to_restart_target(
-        context,
-        guard,
-        own_goal_area_center(context),
-        "opp_restart:guard",
-    )
+    if goalkeeper is not None:
+        _walk_to_restart_target(
+            context,
+            goalkeeper,
+            own_goal_area_center(context),
+            "opp_restart:guard",
+        )
 
-    field_players = [player for player in players if player is not guard]
+    field_players = [
+        player for player in players if player is not goalkeeper
+    ]
     ball = context.ball
     if ball is None:
         for player in field_players:
@@ -656,69 +847,58 @@ def _act_opp_set_play(context: Context, players: list[Player], _store) -> None:
         )
 
 
-def _act_ready(context: Context, players: list[Player]) -> None:
-    """READY:各自走 ready 位。"""
+def _act_ready(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+) -> None:
+    """READY:当前守门员进门前位置,场上机器人使用既有保守站位。"""
+    if not players:
+        return
+
     game = context.game
     our_kickoff = game is not None and game.kicking_team == context.team_id
     field = context.field
-    # 我方开球：优先级站位：(-中圈半径, 0), (我方 goal area 中心点，0)， （0， 中圈半径）
+    if goalkeeper is not None:
+        goalkeeper.action = (
+            "ready:temp_goalkeeper"
+            if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None)
+            else "ready:goalkeeper"
+        )
+        goalkeeper.walk_to(
+            own_goal_area_center(context),
+            face=0.0,
+            avoid_ball=True,
+            avoid_robots=True,
+        )
+
+    field_players = [
+        player for player in players if player is not goalkeeper
+    ]
     if our_kickoff:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-0.5, field.circle_radius + 2),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-    # 对方开球：优先级站位：(-中圈半径 - 0.5, 0), (我方 goal area 中心点，0)， （我方禁区线中心点， 0)
+        ready_targets = [
+            (-field.circle_radius, 0.0),
+            (-0.5, field.circle_radius + 2.0),
+        ]
     else:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius - 0.5, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-field.length / 2.0 + field.penalty_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
+        ready_targets = [
+            (-field.circle_radius - 0.5, 0.0),
+            (-field.length / 2.0 + field.penalty_area_length, 0.0),
+        ]
+
+    for player, target in zip(field_players, ready_targets):
+        player.action = "ready"
+        player.walk_to(
+            target,
+            face=0.0,
+            avoid_ball=True,
+            avoid_robots=True,
+        )
+
+    for player in field_players[len(ready_targets):]:
+        player.action = "ready:hold"
+        player.stop()
 
 
 

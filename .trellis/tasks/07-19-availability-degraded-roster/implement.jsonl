@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Availability and goalkeeper selection must be centralized rather than reimplemented in every phase action."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Trace TeamState.goalkeeper and Penalty data from the framework contract into per-frame strategy roles without modifying protocol types."}
+{"file": ".trellis/tasks/archive/2026-07/07-19-match-state-restart-safety/design.md", "reason": "Preserve T01 opponent-restart safety geometry, independent dispatch, and referee-authority boundaries while changing goalkeeper selection."}

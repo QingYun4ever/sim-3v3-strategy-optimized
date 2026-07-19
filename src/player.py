@@ -256,10 +256,14 @@ class Player:
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
-    def plan_kick(self) -> tuple[float, float] | None:
+    def plan_kick(
+        self,
+        kick_target: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
         """计算踢球方向和力度。
 
-        从当前球位踢向对方球门中心,力度 2.0。
+        从当前球位踢向指定射门目标；未指定时默认对方球门中心。射门力度按
+        球到目标点距离平滑变化，近距离小力、远距离大力。
         返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
         """
         ctx = self.context
@@ -267,42 +271,46 @@ class Player:
         if ctx is None or ball is None:
             return None
 
-        kick_target = opponent_goal(ctx)
+        if kick_target is None:
+            kick_target = opponent_goal(ctx)
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_target = self._goal_target_for_direction(kick_direction)
-        kick_power = (
-            KICK_POWER_BACKFIELD if self._in_backfield()
-            else KICK_POWER_DEFAULT
-        )
+        kick_power = self.shot_power_for_target(kick_target)
 
         self._draw_kick_target(kick_target)
         return kick_direction, kick_power
 
-    def _goal_target_for_direction(
-        self, kick_direction: float,
-    ) -> tuple[float, float]:
-        """把射门方向投到对方门线上,用于可视化踢球目标。"""
-        ctx = self.context
-        ball = ctx.ball if ctx is not None else None
-        if ctx is None or ball is None:
-            return (0.0, 0.0)
+    def shot_power_for_target(self, shot_target: tuple[float, float]) -> float:
+        """按球到射门目标点的距离计算连续、受限的射门力度。"""
+        context = self.context
+        ball = context.ball if context is not None else None
+        if ball is None:
+            return clamp(KICK_POWER_DEFAULT, KICK_POWER_MIN, KICK_POWER_MAX)
 
-        dx = math.cos(kick_direction)
-        if dx <= 1e-6:
-            return opponent_goal(ctx)
-        goal_x = ctx.field.length / 2.0
-        t = max(0.0, (goal_x - ball.x) / dx)
-        return (goal_x, ball.y + math.sin(kick_direction) * t)
+        shot_distance = dist(ball.x, ball.y, shot_target[0], shot_target[1])
+        return self.shot_power_for_distance(shot_distance)
 
-    def _in_backfield(self) -> bool:
-        """球在我方后场时,默认踢球加大力度。"""
-        ctx = self.context
-        ball = ctx.ball if ctx is not None else None
-        if ctx is None or ball is None:
-            return False
-        # own_penalty_edge_x = -ctx.field.length / 2.0 + ctx.field.penalty_area_length
-        # return ball.x < own_penalty_edge_x
-        return ball.x < 0
+    @staticmethod
+    def shot_power_for_distance(shot_distance: float) -> float:
+        """距离到力度的 smoothstep 映射，避免阈值附近跳变。"""
+        distance_span = max(
+            SHOT_POWER_FAR_DISTANCE_M - SHOT_POWER_NEAR_DISTANCE_M,
+            1e-6,
+        )
+        normalized_distance = clamp(
+            (shot_distance - SHOT_POWER_NEAR_DISTANCE_M) / distance_span,
+            0.0,
+            1.0,
+        )
+        smooth_distance = (
+            normalized_distance
+            * normalized_distance
+            * (3.0 - 2.0 * normalized_distance)
+        )
+        raw_power = (
+            SHOT_POWER_NEAR
+            + (SHOT_POWER_FAR - SHOT_POWER_NEAR) * smooth_distance
+        )
+        return clamp(raw_power, KICK_POWER_MIN, KICK_POWER_MAX)
 
     def _draw_kick_target(self, target: tuple[float, float]) -> None:
         """以 X 标出 plan_kick 选择的踢球目标。"""
@@ -788,7 +796,7 @@ class Player:
         )
         if self._kicking:
             self._reset_ball_approach()
-            kick_plan = self.plan_kick()
+            kick_plan = self.plan_kick(kick_target)
             if kick_plan is None:
                 self.stop()
                 return

@@ -4631,10 +4631,11 @@ def _act_our_kickoff(
             )
             if shoot_now:
                 shot_target = opponent_goal(context)
+                shot_power = shooter.shot_power_for_target(shot_target)
                 kicked = _command_kickoff_direct_touch(
                     shooter,
                     shot_target,
-                    KICKOFF_SHOT_POWER,
+                    shot_power,
                     "kickoff:shooter_shoot",
                     kick_distance=KICKOFF_SHOT_KICK_DISTANCE_M,
                     alignment_tolerance=KICKOFF_SHOT_ALIGNMENT_RAD,
@@ -4698,12 +4699,16 @@ def _act_our_kickoff(
             return
 
         if ball is not None:
+            shot_target = opponent_goal(context)
             shot_direction = angle_to(
                 ball.x,
                 ball.y,
-                *opponent_goal(context),
+                *shot_target,
             )
-            shooter.kick(shot_direction, KICKOFF_SHOT_POWER)
+            shooter.kick(
+                shot_direction,
+                shooter.shot_power_for_target(shot_target),
+            )
             shooter.action = "kickoff:verify_second_touch:kicking"
         _act_kickoff_passer_protect(context, passer, roles)
 

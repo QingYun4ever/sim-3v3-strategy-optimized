@@ -17,15 +17,22 @@ import math
 KICK_POWER_MIN = 1.0
 KICK_POWER_MAX = 10.0
 
-# 普通比赛踢球力度。
+# 兜底踢球力度。射门会优先使用下面的动态力度；显式传入 power 的传球、
+# 受控解围和守门员解围继续使用各自独立参数。
 KICK_POWER_DEFAULT = 5.0
 KICK_POWER_BACKFIELD = 5.0
 KICK_POWER_OUR_KICKOFF = 5.0
 
-# 我方中场固定开球专用力度。传球和二脚射门需要分别仿真标定，不能复用
-# 普通射门、后场解围或守门员解围力度。
+# 射门力度按球到射门目标点的距离连续插值。近距离降低力度以减少打偏，
+# 远距离提高力度保证到门；最终仍会经过 KICK_POWER_MIN/MAX 安全夹取。
+SHOT_POWER_NEAR_DISTANCE_M = 1.5
+SHOT_POWER_FAR_DISTANCE_M = 8.0
+SHOT_POWER_NEAR = 4.0
+SHOT_POWER_FAR = 7.0
+
+# 我方中场固定开球传球专用力度。二脚直接射门使用动态射门力度；传球
+# 不能复用普通射门、后场解围或守门员解围力度。
 KICKOFF_PASS_POWER = 1.2
-KICKOFF_SHOT_POWER = 7.0
 
 
 # ======================================================================

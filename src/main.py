@@ -552,6 +552,41 @@ def _get_normal_defense_protect_target(
     )
 
 
+def _act_normal_defense_pressure(
+    context: Context,
+    pressure_player: Player,
+) -> None:
+    """Directly close down the ball, then clear it toward the opponent goal."""
+    ball = context.ball
+    pose = pressure_player.pose
+    if ball is None or pose is None:
+        pressure_player.action = "defense:no_ball"
+        pressure_player.stop()
+        return
+
+    ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    if ball_distance > NORMAL_DEFENSE_PRESSURE_CLEAR_DISTANCE_M:
+        ball_direction = angle_to(pose.x, pose.y, ball.x, ball.y)
+        pressure_player.walk_to(
+            (ball.x, ball.y),
+            face=ball_direction,
+            avoid_ball=False,
+            avoid_robots=False,
+        )
+        pressure_player.action = "defense:pressure:chase"
+        return
+
+    kick_plan = pressure_player.plan_kick()
+    if kick_plan is None:
+        pressure_player.action = "defense:no_ball"
+        pressure_player.stop()
+        return
+
+    kick_direction, kick_power = kick_plan
+    pressure_player.kick(kick_direction, kick_power)
+    pressure_player.action = "defense:pressure:clear"
+
+
 def _act_normal_defense(
     context: Context,
     goalkeeper: Player | None,
@@ -572,11 +607,7 @@ def _act_normal_defense(
         goalkeeper.action = f"defense:goalkeeper:{goalkeeper_kind}"
 
     if pressure_player is not None:
-        pressure_player.action = "attack"
-        pressure_player.attack()
-        pressure_player.action = (
-            f"defense:pressure:{pressure_player.action}"
-        )
+        _act_normal_defense_pressure(context, pressure_player)
 
     if protect_player is not None:
         protect_target = _get_normal_defense_protect_target(context)

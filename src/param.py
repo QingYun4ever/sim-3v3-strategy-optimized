@@ -95,6 +95,9 @@ NORMAL_DEFENSE_PROTECT_DISTANCE_M = 2.0
 NORMAL_DEFENSE_GOAL_LINE_CLEARANCE_M = 1.0
 NORMAL_DEFENSE_FIELD_MARGIN_M = 0.3
 
+# 逼抢球员进入该距离后立即尝试向对方球门方向解围。
+NORMAL_DEFENSE_PRESSURE_CLEAR_DISTANCE_M = 0.5
+
 
 # ======================================================================
 # 丢球恢复

@@ -99,6 +99,16 @@ class KickoffTacticState(Enum):
     ABORT_STOP = "abort_stop"
 
 
+class CornerTacticState(Enum):
+    """我方角球一传一射的跨帧状态。"""
+
+    IDLE = "idle"
+    PASS = "pass"
+    RECEIVE_AND_SHOOT = "receive_and_shoot"
+    COMPLETE = "complete"
+    ABORT = "abort"
+
+
 @dataclass(frozen=True)
 class OpenPlayRoleAssignment:
     """一帧普通比赛的基础职责分配结果。"""
@@ -120,6 +130,17 @@ class KickoffRoles:
     passer_setup: tuple[float, float]
     shooter_setup: tuple[float, float]
     receive_target: tuple[float, float]
+
+
+@dataclass(frozen=True)
+class CornerRoles:
+    """角球锁定职责、侧别和动态接应点。"""
+
+    passer_id: int
+    receiver_id: int | None
+    side_sign: float
+    receive_target: tuple[float, float]
+    pass_start_ball: tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -175,8 +196,6 @@ def get_phase(context: Context) -> Phase:
             our_team = context.team_id
             if g.kicking_team == our_team:
                 return Phase.OUR_KICKOFF
-            if _kickoff_ball_has_moved(context):
-                return Phase.NORMAL
             return Phase.OPP_KICKOFF
 
         # 正常拼抢
@@ -184,14 +203,6 @@ def get_phase(context: Context) -> Phase:
 
     # SET / INITIAL / FINISHED:站定
     return Phase.STOPPED
-
-
-def _kickoff_ball_has_moved(context: Context) -> bool:
-    """对方开球约束解除条件：球离开中点后，我方才恢复移动。"""
-    ball = context.ball
-    if ball is None:
-        return False
-    return dist(ball.x, ball.y, 0.0, 0.0) >= CENTER_LEAVE_DIST_M
 
 
 def get_set_play_type(context: Context) -> SetPlay:
@@ -277,6 +288,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.goalkeeper_post_clear_attacker_id = None
         store.goalkeeper_post_clear_attack_until = None
         store.player_availability = {}
+        store.player_penalties = {}
         store.available_player_ids = ()
         store.default_goalkeeper_id = None
         store.temporary_goalkeeper_id = None
@@ -312,6 +324,14 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.kickoff_ready_shooter_arrived = False
         store.kickoff_safe_first_touch_player_id = None
         store.kickoff_safe_first_touch_done = False
+        store.corner_tactic_state = CornerTacticState.IDLE
+        store.corner_roles = None
+        store.corner_tactic_started_at = None
+        store.corner_state_entered_at = None
+        store.corner_pass_start_seen_at = None
+        store.corner_pass_commanded = False
+        store.corner_first_touch_confirmed = False
+        store.corner_abort_reason = None
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -327,14 +347,22 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         g = context.game
         game_state = g.state.value if g is not None else "none"
         set_play = g.set_play.value if g is not None else "none"
+        stopped = g.stopped if g is not None else True
+        kicking_team = g.kicking_team if g is not None else KICKING_TEAM_NONE
         secondary_time = g.secondary_time if g is not None else 0.0
         debugdraw.text(
             0.0, context.field.width / 2.0 + 0.2,
-            f"phase={phase.value} state={game_state} set={set_play} secondary={secondary_time:.1f}",
+            f"phase={phase.value} state={game_state} stopped={stopped} "
+            f"set={set_play} kickingTeam={kicking_team} "
+            f"secondary={secondary_time:.1f}",
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
 
-        available_players = _collect_available_players(players, store)
+        available_players = _collect_available_players(
+            context,
+            players,
+            store,
+        )
         current_goalkeeper = _select_current_goalkeeper(
             context,
             players,
@@ -360,20 +388,33 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
                 )
             else:
                 _clear_kickoff_tactic(store, "referee_window_cleared")
-                _act_normal(
-                    context,
-                    available_players,
-                    current_goalkeeper,
-                    store,
-                )
+                if _should_finish_corner_followup(context, store):
+                    _clear_normal_sticky(store)
+                    _act_our_corner(
+                        context,
+                        available_players,
+                        current_goalkeeper,
+                        store,
+                        followup_after_referee_clear=True,
+                    )
+                else:
+                    _clear_corner_tactic(store, "normal_play")
+                    _act_normal(
+                        context,
+                        available_players,
+                        current_goalkeeper,
+                        store,
+                    )
         elif phase == Phase.OUR_KICKOFF:
             _clear_normal_sticky(store)
+            _clear_corner_tactic(store, "our_kickoff")
             _act_our_kickoff(
                 context, available_players, current_goalkeeper, store,
             )
         elif phase == Phase.OPP_KICKOFF:
             _clear_normal_sticky(store)
             _clear_kickoff_tactic(store, "opponent_kickoff")
+            _clear_corner_tactic(store, "opponent_kickoff")
             _act_opp_kickoff(context, available_players, current_goalkeeper)
         elif phase == Phase.OUR_SET_PLAY:
             _clear_normal_sticky(store)
@@ -384,14 +425,17 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         elif phase == Phase.OPP_SET_PLAY:
             _clear_normal_sticky(store)
             _clear_kickoff_tactic(store, "opponent_set_play")
+            _clear_corner_tactic(store, "opponent_set_play")
             _act_opp_set_play(
                 context, available_players, current_goalkeeper, store,
             )
         elif phase == Phase.READY:
             _clear_normal_sticky(store)
+            _clear_corner_tactic(store, "ready")
             _act_ready(context, available_players, current_goalkeeper, store)
         elif phase == Phase.STOPPED:
             _clear_normal_sticky(store)
+            _clear_corner_tactic(store, "stopped")
             if _is_our_kickoff_set(context):
                 if getattr(store, "kickoff_roles", None) is not None:
                     _enter_kickoff_state(
@@ -403,7 +447,11 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             else:
                 _clear_kickoff_tactic(store, "stopped_not_our_kickoff_set")
             for player in available_players:
-                player.action = "stopped"
+                player.action = (
+                    "set:stopped"
+                    if g is not None and g.state == GameState.SET
+                    else "stopped"
+                )
                 player.stop()
 
         # 队员可视化统一在最后画一遍:覆盖所有球员(含判罚/未就绪/STOPPED),
@@ -412,14 +460,56 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             _draw_teammate_marker(p)
 
 
-def _collect_available_players(players: list[Player], store) -> list[Player]:
+def _collect_available_players(
+    context: Context,
+    players: list[Player],
+    store,
+) -> list[Player]:
     """统一分类每帧可用性,并清除不可用球员的旧动作命令。"""
     player_availability: dict[int, str] = {}
+    player_penalties: dict[int, str] = {}
     available_players: list[Player] = []
+    previous_penalties = getattr(store, "player_penalties", {})
 
     for player in players:
         ready = player.ensure_ready()
-        if player.is_penalized:
+        penalty = player.penalty
+        penalty_name = penalty.value
+        previous_penalty_name = previous_penalties.get(player.id)
+        previous_action = player.action
+        previous_velocity = player.last_commanded_velocity
+        previous_target = player.last_motion_target
+        previous_waypoint = player.last_selected_waypoint
+        if (
+            previous_penalty_name != penalty_name
+            and (
+                previous_penalty_name is not None
+                or penalty_name != "NONE"
+            )
+        ):
+            _log.warning(
+                "player %d penalty transition %s -> %s phase=%s "
+                "GameState=%s stopped=%s setPlay=%s kickingTeam=%s "
+                "secondaryTime=%.3f previous_action=%s pose=%r target=%r "
+                "waypoint=%r previous_velocity=%r",
+                player.id,
+                previous_penalty_name or "unobserved",
+                penalty_name,
+                store.cur_phase.value,
+                context.game.state.value if context.game is not None else "none",
+                context.game.stopped if context.game is not None else True,
+                context.game.set_play.value if context.game is not None else "none",
+                context.game.kicking_team if context.game is not None else KICKING_TEAM_NONE,
+                context.game.secondary_time if context.game is not None else 0.0,
+                previous_action,
+                player.pose,
+                previous_target,
+                previous_waypoint,
+                previous_velocity,
+            )
+
+        player_penalties[player.id] = penalty_name
+        if penalty_name != "NONE":
             availability = "penalized"
         elif player.is_fallen:
             availability = "fallen"
@@ -431,13 +521,17 @@ def _collect_available_players(players: list[Player], store) -> list[Player]:
             availability = "available"
 
         player_availability[player.id] = availability
-        player.action = availability
+        player.action = (
+            f"penalized:{penalty_name}"
+            if availability == "penalized" else availability
+        )
         if availability == "available":
             available_players.append(player)
         else:
             player.stop()
 
     store.player_availability = player_availability
+    store.player_penalties = player_penalties
     store.available_player_ids = tuple(
         player.id for player in available_players
     )
@@ -4761,13 +4855,25 @@ def _act_our_kickoff(
 def _clamp_restart_target(
     context: Context,
     target: tuple[float, float],
+    *,
+    stay_in_own_half: bool = False,
 ) -> tuple[float, float]:
     """把重启等待点限制在场内,避免规则避让点落到边线之外。"""
-    field_margin = 0.3
+    target_buffer = (
+        OPPONENT_KICKOFF_TARGET_BUFFER_M if stay_in_own_half else 0.0
+    )
+    field_margin = 0.3 + target_buffer
     half_length = max(0.0, context.field.length / 2.0 - field_margin)
     half_width = max(0.0, context.field.width / 2.0 - field_margin)
+    maximum_x = (
+        -(
+            OPPONENT_KICKOFF_HALF_MARGIN_M
+            + OPPONENT_KICKOFF_TARGET_BUFFER_M
+        )
+        if stay_in_own_half else half_length
+    )
     return (
-        clamp(target[0], -half_length, half_length),
+        clamp(target[0], -half_length, maximum_x),
         clamp(target[1], -half_width, half_width),
     )
 
@@ -4807,10 +4913,21 @@ def _prepare_restart_target(
     preferred_target: tuple[float, float],
     *,
     stay_outside_center_circle: bool = False,
+    stay_in_own_half: bool = False,
+    use_center_when_ball_unknown: bool = False,
 ) -> tuple[float, float]:
     """生成场内、避球且可选中圈外的对方重启等待点。"""
-    target = _clamp_restart_target(context, preferred_target)
+    target = _clamp_restart_target(
+        context,
+        preferred_target,
+        stay_in_own_half=stay_in_own_half,
+    )
     own_goal_x, own_goal_y = own_goal(context)
+    ball = context.ball
+    restart_origin = (
+        (ball.x, ball.y)
+        if ball is not None else (0.0, 0.0)
+    )
 
     # 反复投影可处理球不完全位于中点时两个禁入圆部分重叠的情况。
     for _projection_pass in range(4):
@@ -4818,22 +4935,160 @@ def _prepare_restart_target(
             target = _project_target_outside_radius(
                 target,
                 (0.0, 0.0),
-                context.field.circle_radius + CIRCLE_MARGIN_M,
+                (
+                    context.field.circle_radius
+                    + CIRCLE_MARGIN_M
+                    + (
+                        OPPONENT_KICKOFF_TARGET_BUFFER_M
+                        if stay_in_own_half else 0.0
+                    )
+                ),
                 (-1.0, 0.0),
             )
-            target = _clamp_restart_target(context, target)
+            target = _clamp_restart_target(
+                context,
+                target,
+                stay_in_own_half=stay_in_own_half,
+            )
 
-        ball = context.ball
-        if ball is not None:
+        if ball is not None or use_center_when_ball_unknown:
             target = _project_target_outside_radius(
                 target,
-                (ball.x, ball.y),
-                OPPONENT_RESTART_AVOID_M,
-                (own_goal_x - ball.x, own_goal_y - ball.y),
+                restart_origin,
+                (
+                    OPPONENT_RESTART_AVOID_M
+                    + (
+                        OPPONENT_KICKOFF_TARGET_BUFFER_M
+                        if stay_in_own_half else 0.0
+                    )
+                ),
+                (
+                    own_goal_x - restart_origin[0],
+                    own_goal_y - restart_origin[1],
+                ),
             )
-            target = _clamp_restart_target(context, target)
+            target = _clamp_restart_target(
+                context,
+                target,
+                stay_in_own_half=stay_in_own_half,
+            )
 
     return target
+
+
+def _opponent_kickoff_forbidden_circles(
+    context: Context,
+) -> tuple[tuple[tuple[float, float], float], ...]:
+    ball = context.ball
+    restart_origin = (
+        (ball.x, ball.y)
+        if ball is not None else (0.0, 0.0)
+    )
+    return (
+        (
+            (0.0, 0.0),
+            context.field.circle_radius + CIRCLE_MARGIN_M,
+        ),
+        (restart_origin, OPPONENT_RESTART_AVOID_M),
+    )
+
+
+def _opponent_kickoff_position_is_legal(
+    context: Context,
+    position: tuple[float, float],
+) -> bool:
+    field_margin = 0.3
+    half_length = max(0.0, context.field.length / 2.0 - field_margin)
+    half_width = max(0.0, context.field.width / 2.0 - field_margin)
+    if not (
+        -half_length <= position[0] <= -OPPONENT_KICKOFF_HALF_MARGIN_M
+        and -half_width <= position[1] <= half_width
+    ):
+        return False
+    return all(
+        dist(position[0], position[1], center[0], center[1])
+        >= radius
+        for center, radius in _opponent_kickoff_forbidden_circles(context)
+    )
+
+
+def _segment_axis_respects_bounds(
+    start_value: float,
+    end_value: float,
+    minimum_value: float,
+    maximum_value: float,
+) -> bool:
+    tolerance = 1e-6
+    if start_value < minimum_value:
+        return (
+            end_value >= start_value - tolerance
+            and end_value <= maximum_value + tolerance
+        )
+    if start_value > maximum_value:
+        return (
+            end_value <= start_value + tolerance
+            and end_value >= minimum_value - tolerance
+        )
+    return minimum_value - tolerance <= end_value <= maximum_value + tolerance
+
+
+def _opponent_kickoff_segment_is_safe(
+    context: Context,
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> bool:
+    """Keep legal segments legal and make every inherited violation improve."""
+    field_margin = 0.3
+    half_length = max(0.0, context.field.length / 2.0 - field_margin)
+    half_width = max(0.0, context.field.width / 2.0 - field_margin)
+    if not _segment_axis_respects_bounds(
+        segment_start[0],
+        segment_end[0],
+        -half_length,
+        -OPPONENT_KICKOFF_HALF_MARGIN_M,
+    ):
+        return False
+    if not _segment_axis_respects_bounds(
+        segment_start[1],
+        segment_end[1],
+        -half_width,
+        half_width,
+    ):
+        return False
+
+    segment_delta = (
+        segment_end[0] - segment_start[0],
+        segment_end[1] - segment_start[1],
+    )
+    tolerance = 1e-6
+    for center, radius in _opponent_kickoff_forbidden_circles(context):
+        start_offset = (
+            segment_start[0] - center[0],
+            segment_start[1] - center[1],
+        )
+        start_distance = math.hypot(*start_offset)
+        if start_distance >= radius - tolerance:
+            if _point_segment_distance(
+                center,
+                segment_start,
+                segment_end,
+            ) < radius - tolerance:
+                return False
+            continue
+
+        outward_progress = (
+            start_offset[0] * segment_delta[0]
+            + start_offset[1] * segment_delta[1]
+        )
+        end_distance = dist(
+            segment_end[0],
+            segment_end[1],
+            center[0],
+            center[1],
+        )
+        if outward_progress < -tolerance or end_distance <= start_distance:
+            return False
+    return True
 
 
 def _walk_to_restart_target(
@@ -4843,17 +5098,33 @@ def _walk_to_restart_target(
     action: str,
     *,
     stay_outside_center_circle: bool = False,
+    enforce_opponent_kickoff_rules: bool = False,
 ) -> None:
     """对方重启期间只执行避球、避机器人的安全走位。"""
     safe_target = _prepare_restart_target(
         context,
         target,
-        stay_outside_center_circle=stay_outside_center_circle,
+        stay_outside_center_circle=(
+            stay_outside_center_circle or enforce_opponent_kickoff_rules
+        ),
+        stay_in_own_half=enforce_opponent_kickoff_rules,
+        use_center_when_ball_unknown=enforce_opponent_kickoff_rules,
     )
     face = 0.0
     ball = context.ball
     if ball is not None:
         face = angle_to(player.pose.x, player.pose.y, ball.x, ball.y)
+    movement_segment_constraint = None
+    if enforce_opponent_kickoff_rules:
+        movement_segment_constraint = (
+            lambda segment_start, segment_end: (
+                _opponent_kickoff_segment_is_safe(
+                    context,
+                    segment_start,
+                    segment_end,
+                )
+            )
+        )
 
     player.action = action
     player.walk_to(
@@ -4861,6 +5132,7 @@ def _walk_to_restart_target(
         face=face,
         avoid_ball=True,
         avoid_robots=True,
+        movement_segment_constraint=movement_segment_constraint,
     )
 
 
@@ -4869,16 +5141,675 @@ def _act_opp_kickoff(
     players: list[Player],
     goalkeeper: Player | None,
 ) -> None:
-    """对方中场开球:PLAYING 后先完全静止，直到球离开中点。"""
+    """对方中场开球:合法球员保持，非法球员只做规则纠正。"""
     if not players:
         return
 
+    field = context.field
+    corrective_slots = [
+        (-field.circle_radius - CIRCLE_MARGIN_M - 0.6, 1.8),
+        (-field.circle_radius - CIRCLE_MARGIN_M - 0.6, -1.8),
+    ]
+    field_player_index = 0
     for player in players:
-        player.action = (
-            "opp_kickoff:wait_guard"
-            if player is goalkeeper else "opp_kickoff:wait_touch"
+        position = (player.pose.x, player.pose.y)
+        if _opponent_kickoff_position_is_legal(context, position):
+            player.action = (
+                "opp_kickoff:hold_guard"
+                if player is goalkeeper else "opp_kickoff:hold"
+            )
+            player.stop()
+            continue
+
+        if player is goalkeeper:
+            target = own_goal_area_center(context)
+            action = "opp_kickoff:correct_guard"
+        else:
+            target = corrective_slots[
+                min(field_player_index, len(corrective_slots) - 1)
+            ]
+            field_player_index += 1
+            action = "opp_kickoff:correct_position"
+        _walk_to_restart_target(
+            context,
+            player,
+            target,
+            action,
+            enforce_opponent_kickoff_rules=True,
         )
+
+
+def _clear_corner_tactic(store, reason: str) -> None:
+    """清理角球锁定状态，避免失败后反复回角旗重跑。"""
+    store.corner_tactic_state = CornerTacticState.IDLE
+    store.corner_roles = None
+    store.corner_tactic_started_at = None
+    store.corner_state_entered_at = None
+    store.corner_pass_start_seen_at = None
+    store.corner_pass_commanded = False
+    store.corner_first_touch_confirmed = False
+    store.corner_abort_reason = reason
+
+
+def _enter_corner_state(
+    store,
+    state: CornerTacticState,
+    now: float,
+    reason: str | None = None,
+) -> None:
+    if getattr(store, "corner_tactic_state", CornerTacticState.IDLE) == state:
+        return
+    store.corner_tactic_state = state
+    store.corner_state_entered_at = now
+    if reason is not None:
+        store.corner_abort_reason = reason
+
+
+def _corner_clamp_target(
+    context: Context,
+    target: tuple[float, float],
+) -> tuple[float, float]:
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - CORNER_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - CORNER_FIELD_MARGIN_M,
+    )
+    return (
+        clamp(target[0], -half_length, half_length),
+        clamp(target[1], -half_width, half_width),
+    )
+
+
+def _ball_is_outside_field(context: Context, margin: float = 0.05) -> bool:
+    ball = context.ball
+    if ball is None:
+        return True
+    return (
+        abs(ball.x) > context.field.length / 2.0 + margin
+        or abs(ball.y) > context.field.width / 2.0 + margin
+    )
+
+
+def _point_segment_distance(
+    point: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> float:
+    segment_x = segment_end[0] - segment_start[0]
+    segment_y = segment_end[1] - segment_start[1]
+    segment_length_squared = segment_x * segment_x + segment_y * segment_y
+    if segment_length_squared <= 1e-9:
+        return dist(point[0], point[1], segment_start[0], segment_start[1])
+    projection = (
+        (point[0] - segment_start[0]) * segment_x
+        + (point[1] - segment_start[1]) * segment_y
+    ) / segment_length_squared
+    projection = clamp(projection, 0.0, 1.0)
+    nearest_x = segment_start[0] + segment_x * projection
+    nearest_y = segment_start[1] + segment_y * projection
+    return dist(point[0], point[1], nearest_x, nearest_y)
+
+
+def _opponent_clearance_from_segment(
+    context: Context,
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> float | None:
+    distances = [
+        _point_segment_distance(
+            (robot.pose.x, robot.pose.y),
+            segment_start,
+            segment_end,
+        )
+        for robot in context.opponents.values()
+        if robot.pose is not None
+    ]
+    return min(distances) if distances else None
+
+
+def _select_corner_receive_target(
+    context: Context,
+    receiver: Player | None,
+    side_sign: float,
+) -> tuple[float, float]:
+    """在对方禁区附近动态选一个传球和射门线路都较干净的接应点。"""
+    ball = context.ball
+    if ball is None:
+        return _corner_clamp_target(context, opponent_goal(context))
+
+    opponent_goal_x, opponent_goal_y = opponent_goal(context)
+    penalty_length = context.field.penalty_area_length
+    penalty_half_width = context.field.penalty_area_width / 2.0
+    candidate_targets = [
+        (opponent_goal_x - penalty_length * 0.65, side_sign * 0.45),
+        (opponent_goal_x - penalty_length * 0.80, side_sign * 1.05),
+        (opponent_goal_x - penalty_length * 0.55, 0.0),
+        (opponent_goal_x - penalty_length * 0.95, -side_sign * 0.35),
+        (
+            opponent_goal_x - penalty_length * 0.70,
+            side_sign * min(penalty_half_width * 0.75, 1.6),
+        ),
+    ]
+
+    best_target = _corner_clamp_target(context, candidate_targets[0])
+    best_score = -math.inf
+    for raw_target in candidate_targets:
+        target = _corner_clamp_target(context, raw_target)
+        pass_clearance = _opponent_clearance_from_segment(
+            context,
+            (ball.x, ball.y),
+            target,
+        )
+        shot_clearance = _opponent_clearance_from_segment(
+            context,
+            target,
+            (opponent_goal_x, opponent_goal_y),
+        )
+        receiver_cost = 0.0
+        if receiver is not None and receiver.pose is not None:
+            receiver_cost = 0.35 * dist(
+                receiver.pose.x,
+                receiver.pose.y,
+                target[0],
+                target[1],
+            )
+        central_lane_bonus = 0.6 if abs(target[1]) <= penalty_half_width else 0.0
+        score = central_lane_bonus - receiver_cost
+        if pass_clearance is not None:
+            score += min(pass_clearance, 2.5)
+        else:
+            score += 1.0
+        if shot_clearance is not None:
+            score += 0.8 * min(shot_clearance, 2.5)
+        else:
+            score += 0.8
+        if score > best_score:
+            best_score = score
+            best_target = target
+    return best_target
+
+
+def _select_corner_roles(
+    context: Context,
+    field_players: list[Player],
+) -> CornerRoles | None:
+    ball = context.ball
+    if ball is None or not field_players:
+        return None
+
+    side_sign = 1.0 if ball.y >= 0.0 else -1.0
+    candidates = [player for player in field_players if player.pose is not None]
+    if not candidates:
+        return None
+    passer = min(
+        candidates,
+        key=lambda player: dist(player.pose.x, player.pose.y, ball.x, ball.y),
+    )
+    receiver_candidates = [player for player in candidates if player is not passer]
+    if not receiver_candidates:
+        receive_target = _corner_clamp_target(
+            context,
+            (
+                CORNER_SINGLE_PLAYER_SAFE_TOUCH_X_M,
+                side_sign * CORNER_SINGLE_PLAYER_SAFE_TOUCH_Y_M,
+            ),
+        )
+        return CornerRoles(
+            passer_id=passer.id,
+            receiver_id=None,
+            side_sign=side_sign,
+            receive_target=receive_target,
+            pass_start_ball=(ball.x, ball.y),
+        )
+
+    receiver = min(
+        receiver_candidates,
+        key=lambda player: dist(
+            player.pose.x,
+            player.pose.y,
+            context.field.length / 2.0 - context.field.penalty_area_length,
+            0.0,
+        ),
+    )
+    receive_target = _select_corner_receive_target(context, receiver, side_sign)
+    return CornerRoles(
+        passer_id=passer.id,
+        receiver_id=receiver.id,
+        side_sign=side_sign,
+        receive_target=receive_target,
+        pass_start_ball=(ball.x, ball.y),
+    )
+
+
+def _get_corner_role_players(
+    field_players: list[Player],
+    roles: CornerRoles | None,
+) -> tuple[Player | None, Player | None]:
+    if roles is None:
+        return None, None
+    passer = next(
+        (player for player in field_players if player.id == roles.passer_id),
+        None,
+    )
+    receiver = next(
+        (
+            player for player in field_players
+            if player.id == roles.receiver_id
+        ),
+        None,
+    )
+    return passer, receiver
+
+
+def _initialize_corner_tactic(
+    context: Context,
+    field_players: list[Player],
+    store,
+) -> bool:
+    roles = getattr(store, "corner_roles", None)
+    if roles is not None:
+        return True
+
+    roles = _select_corner_roles(context, field_players)
+    if roles is None:
+        _clear_corner_tactic(store, "no_corner_roles")
+        return False
+    store.corner_roles = roles
+    store.locked_roles = {
+        "corner_passer": roles.passer_id,
+        "corner_receiver": roles.receiver_id,
+    }
+    store.tactic_roles = store.locked_roles
+    store.active_tactic = "our_corner"
+    store.corner_tactic_started_at = context.now
+    store.corner_pass_start_seen_at = (
+        context.ball.last_seen_at if context.ball is not None else context.now
+    )
+    store.corner_pass_commanded = False
+    store.corner_first_touch_confirmed = False
+    _enter_corner_state(store, CornerTacticState.PASS, context.now)
+    return True
+
+
+def _command_corner_touch(
+    player: Player,
+    target: tuple[float, float],
+    power: float,
+    action_prefix: str,
+    *,
+    kick_distance: float,
+    alignment_tolerance: float,
+    ball_bearing_tolerance: float,
+    approach_behind: float,
+) -> bool:
+    context = player.context
+    ball = context.ball if context is not None else None
+    pose = player.pose
+    if context is None or ball is None or pose is None:
+        player.action = f"{action_prefix}:stop"
         player.stop()
+        return False
+
+    kick_direction = angle_to(ball.x, ball.y, target[0], target[1])
+    desired_behind_angle = _normalize_angle(kick_direction + math.pi)
+    player_angle_around_ball = angle_to(ball.x, ball.y, pose.x, pose.y)
+    alignment_error = abs(_normalize_angle(
+        desired_behind_angle - player_angle_around_ball,
+    ))
+    ball_bearing = abs(_normalize_angle(
+        angle_to(pose.x, pose.y, ball.x, ball.y) - pose.theta,
+    ))
+    ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    close_corner_touch = (
+        action_prefix == "corner:passer"
+        and ball_distance <= CORNER_PASSER_CLOSE_TOUCH_M
+    )
+
+    player._draw_kick_target(target)
+    if (
+        close_corner_touch
+        or (
+            ball_distance <= kick_distance
+            and alignment_error <= alignment_tolerance
+            and ball_bearing <= ball_bearing_tolerance
+        )
+    ):
+        player.kick(kick_direction, power)
+        player.action = f"{action_prefix}:kick"
+        return True
+
+    raw_approach_target = (
+        ball.x - math.cos(kick_direction) * approach_behind,
+        ball.y - math.sin(kick_direction) * approach_behind,
+    )
+    approach_target = _corner_clamp_target(context, raw_approach_target)
+    player.release_kick()
+    player.walk_to(
+        approach_target,
+        face=kick_direction,
+        avoid_ball=False,
+        avoid_robots=False,
+        arrive_dist=min(ARRIVE_DIST, approach_behind * 0.75),
+    )
+    player.action = f"{action_prefix}:approach"
+    return False
+
+
+def _corner_ball_has_moved_toward_receive(
+    context: Context,
+    roles: CornerRoles,
+    store,
+) -> bool:
+    ball = context.ball
+    start_ball = roles.pass_start_ball
+    start_seen_at = getattr(store, "corner_pass_start_seen_at", None)
+    if ball is None or start_seen_at is None:
+        return False
+    ball_seen_at = ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
+    if ball_seen_at <= start_seen_at:
+        return False
+
+    moved_x = ball.x - start_ball[0]
+    moved_y = ball.y - start_ball[1]
+    moved_distance = math.hypot(moved_x, moved_y)
+    if moved_distance < CORNER_BALL_MOVED_DISTANCE_M:
+        return False
+    target_x = roles.receive_target[0] - start_ball[0]
+    target_y = roles.receive_target[1] - start_ball[1]
+    target_distance = math.hypot(target_x, target_y)
+    if target_distance <= 1e-6:
+        return False
+    direction_dot = (
+        (moved_x / moved_distance) * (target_x / target_distance)
+        + (moved_y / moved_distance) * (target_y / target_distance)
+    )
+    ball_left_corner = (
+        abs(ball.x) < context.field.length / 2.0 - 0.10
+        and abs(ball.y) < context.field.width / 2.0 - 0.10
+    )
+    return ball_left_corner and direction_dot >= CORNER_PASS_DIRECTION_DOT_MIN
+
+
+def _corner_ball_in_receive_zone(
+    context: Context,
+    receiver: Player,
+    roles: CornerRoles,
+) -> bool:
+    ball = context.ball
+    pose = receiver.pose
+    if ball is None or pose is None:
+        return False
+    ball_receive_distance = dist(
+        ball.x,
+        ball.y,
+        roles.receive_target[0],
+        roles.receive_target[1],
+    )
+    receiver_ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    return (
+        ball_receive_distance <= CORNER_RECEIVE_ZONE_RADIUS_M
+        or receiver_ball_distance <= CORNER_SHOT_KICK_DISTANCE_M
+    )
+
+
+def _corner_ball_is_severely_off_course(
+    context: Context,
+    roles: CornerRoles,
+) -> bool:
+    ball = context.ball
+    if ball is None or _ball_is_outside_field(context):
+        return True
+    corridor_distance = _point_segment_distance(
+        (ball.x, ball.y),
+        roles.pass_start_ball,
+        roles.receive_target,
+    )
+    receive_distance = dist(
+        ball.x,
+        ball.y,
+        roles.receive_target[0],
+        roles.receive_target[1],
+    )
+    return (
+        corridor_distance > CORNER_RECEIVE_CORRIDOR_WIDTH_M
+        and receive_distance > CORNER_SEVERE_MISS_DISTANCE_M
+    )
+
+
+def _corner_opponent_controls_ball(context: Context) -> bool:
+    nearest_opponent_distance = _nearest_opponent_distance(context)
+    return (
+        nearest_opponent_distance is not None
+        and nearest_opponent_distance <= CORNER_OPPONENT_INTERCEPT_DISTANCE_M
+    )
+
+
+def _should_finish_corner_followup(context: Context, store) -> bool:
+    """裁判清除 set_play 后，只短暂延续已完成第一脚的接应射门。"""
+    roles = getattr(store, "corner_roles", None)
+    if roles is None:
+        return False
+    state = getattr(store, "corner_tactic_state", CornerTacticState.IDLE)
+    pass_commanded = bool(getattr(store, "corner_pass_commanded", False))
+    if state == CornerTacticState.PASS and not pass_commanded:
+        return False
+    if state not in (CornerTacticState.PASS, CornerTacticState.RECEIVE_AND_SHOOT):
+        return False
+    if state == CornerTacticState.RECEIVE_AND_SHOOT and not getattr(
+        store,
+        "corner_first_touch_confirmed",
+        False,
+    ):
+        return False
+    game = context.game
+    if game is None or game.state != GameState.PLAYING or game.stopped:
+        return False
+    started_at = getattr(store, "corner_tactic_started_at", None)
+    if started_at is None or context.now - started_at > CORNER_TOTAL_TIMEOUT_SEC:
+        _clear_corner_tactic(store, "corner_total_timeout")
+        return False
+    if _corner_ball_is_severely_off_course(context, roles):
+        _clear_corner_tactic(store, "corner_severe_miss")
+        return False
+    if _corner_opponent_controls_ball(context):
+        _clear_corner_tactic(store, "corner_intercepted")
+        return False
+    return True
+
+
+def _draw_corner_tactic(context: Context, store) -> None:
+    from .framework import debugdraw
+
+    roles = getattr(store, "corner_roles", None)
+    state = getattr(store, "corner_tactic_state", CornerTacticState.IDLE)
+    if roles is None and state == CornerTacticState.IDLE:
+        return
+    debugdraw.text(
+        0.0,
+        context.field.width / 2.0 + 0.85,
+        (
+            f"corner={state.value} passer="
+            f"{roles.passer_id if roles else '-'} receiver="
+            f"{roles.receiver_id if roles else '-'} abort="
+            f"{getattr(store, 'corner_abort_reason', None) or '-'}"
+        ),
+        rgb=(0.2, 0.9, 1.0),
+        ns="corner_tactic",
+    )
+    if roles is None:
+        return
+    debugdraw.point(
+        roles.receive_target[0], roles.receive_target[1],
+        rgb=(0.2, 0.9, 1.0), scale=0.24, ns="corner_receive",
+    )
+    ball = context.ball
+    if ball is not None:
+        debugdraw.line(
+            [(ball.x, ball.y), roles.receive_target],
+            rgb=(0.2, 0.9, 1.0), ns="corner_pass_line",
+        )
+        debugdraw.line(
+            [roles.receive_target, opponent_goal(context)],
+            rgb=(1.0, 1.0, 1.0), ns="corner_shot_line",
+        )
+
+
+def _act_our_corner(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+    store,
+    *,
+    followup_after_referee_clear: bool = False,
+) -> None:
+    """OUR_SET_PLAY/CORNER:锁定一人发球、一人接应直接射门。"""
+    field_players = [player for player in players if player is not goalkeeper]
+    if goalkeeper is not None:
+        _act_goalkeeper_guard(
+            context,
+            goalkeeper,
+            field_players,
+            store,
+            allow_active_response=False,
+        )
+    if not field_players or context.ball is None or _ball_is_outside_field(context):
+        _clear_corner_tactic(store, "corner_no_ball_or_player")
+        return
+
+    if not _initialize_corner_tactic(context, field_players, store):
+        return
+    roles = getattr(store, "corner_roles", None)
+    passer, receiver = _get_corner_role_players(field_players, roles)
+    if roles is None or passer is None:
+        _clear_corner_tactic(store, "corner_passer_unavailable")
+        return
+    if roles.receiver_id is not None and receiver is None:
+        _clear_corner_tactic(store, "corner_receiver_unavailable")
+        return
+
+    started_at = getattr(store, "corner_tactic_started_at", context.now)
+    if context.now - started_at > CORNER_TOTAL_TIMEOUT_SEC:
+        _clear_corner_tactic(store, "corner_total_timeout")
+        return
+
+    if roles.receiver_id is None:
+        kicked = _command_corner_touch(
+            passer,
+            roles.receive_target,
+            CORNER_PASS_POWER,
+            "corner:single_safe_touch",
+            kick_distance=CORNER_PASS_KICK_DISTANCE_M,
+            alignment_tolerance=CORNER_PASS_ALIGNMENT_RAD,
+            ball_bearing_tolerance=CORNER_PASS_BALL_BEARING_RAD,
+            approach_behind=CORNER_PASS_APPROACH_BEHIND_M,
+        )
+        if kicked or _corner_ball_has_moved_toward_receive(context, roles, store):
+            _clear_corner_tactic(store, "corner_single_player_touch")
+        _draw_corner_tactic(context, store)
+        return
+
+    state = getattr(store, "corner_tactic_state", CornerTacticState.IDLE)
+    state_entered_at = getattr(store, "corner_state_entered_at", context.now)
+    if state == CornerTacticState.PASS:
+        if getattr(store, "corner_pass_commanded", False):
+            kicked = False
+            passer.action = "corner:passer_wait_ball_move"
+            passer.stop()
+        else:
+            kicked = _command_corner_touch(
+                passer,
+                roles.receive_target,
+                CORNER_PASS_POWER,
+                "corner:passer",
+                kick_distance=CORNER_PASS_KICK_DISTANCE_M,
+                alignment_tolerance=CORNER_PASS_ALIGNMENT_RAD,
+                ball_bearing_tolerance=CORNER_PASS_BALL_BEARING_RAD,
+                approach_behind=CORNER_PASS_APPROACH_BEHIND_M,
+            )
+            if kicked:
+                store.corner_pass_commanded = True
+        if receiver is not None:
+            shot_face = angle_to(
+                receiver.pose.x,
+                receiver.pose.y,
+                *opponent_goal(context),
+            ) if receiver.pose is not None else None
+            receiver.walk_to(
+                roles.receive_target,
+                face=shot_face,
+                avoid_ball=True,
+                avoid_robots=True,
+                arrive_dist=CORNER_RECEIVE_ZONE_RADIUS_M * 0.45,
+            )
+            receiver.action = "corner:receiver_setup"
+        ball_moved_toward_receive = _corner_ball_has_moved_toward_receive(
+            context,
+            roles,
+            store,
+        )
+        if ball_moved_toward_receive:
+            store.corner_first_touch_confirmed = True
+            _enter_corner_state(
+                store,
+                CornerTacticState.RECEIVE_AND_SHOOT,
+                context.now,
+            )
+        elif context.now - state_entered_at > CORNER_PASS_TIMEOUT_SEC:
+            _clear_corner_tactic(store, "corner_pass_timeout")
+        _draw_corner_tactic(context, store)
+        return
+
+    if state == CornerTacticState.RECEIVE_AND_SHOOT:
+        if not followup_after_referee_clear and get_set_play_type(context) != SetPlay.CORNER_KICK:
+            _clear_corner_tactic(store, "corner_referee_window_closed")
+            return
+        if _corner_ball_is_severely_off_course(context, roles):
+            _clear_corner_tactic(store, "corner_severe_miss")
+            return
+        if _corner_opponent_controls_ball(context):
+            _clear_corner_tactic(store, "corner_intercepted")
+            return
+        if context.now - state_entered_at > CORNER_RECEIVE_TIMEOUT_SEC:
+            _clear_corner_tactic(store, "corner_receive_timeout")
+            return
+        if receiver is None:
+            _clear_corner_tactic(store, "corner_receiver_unavailable")
+            return
+
+        shot_target = opponent_goal(context)
+        if _corner_ball_in_receive_zone(context, receiver, roles):
+            shot_power = receiver.shot_power_for_target(shot_target)
+            _command_corner_touch(
+                receiver,
+                shot_target,
+                shot_power,
+                "corner:receiver_shoot",
+                kick_distance=CORNER_SHOT_KICK_DISTANCE_M,
+                alignment_tolerance=CORNER_SHOT_ALIGNMENT_RAD,
+                ball_bearing_tolerance=CORNER_SHOT_BALL_BEARING_RAD,
+                approach_behind=CORNER_SHOT_APPROACH_BEHIND_M,
+            )
+            passer.action = "corner:passer_follow_hold"
+            passer.stop()
+        else:
+            receiver.walk_to(
+                roles.receive_target,
+                face=angle_to(receiver.pose.x, receiver.pose.y, *shot_target)
+                if receiver.pose is not None else None,
+                avoid_ball=False,
+                avoid_robots=True,
+                arrive_dist=CORNER_RECEIVE_ZONE_RADIUS_M * 0.45,
+            )
+            receiver.action = "corner:receiver_attack_ball"
+            passer.action = "corner:passer_wait_shot"
+            passer.stop()
+        _draw_corner_tactic(context, store)
+        return
+
+    _clear_corner_tactic(store, "corner_invalid_state")
 
 
 def _act_our_set_play(
@@ -4904,20 +5835,21 @@ def _act_our_set_play(
 
     set_play = get_set_play_type(context)
     if set_play == SetPlay.THROW_IN:
+        _clear_corner_tactic(store, "throw_in_not_corner")
         _act_normal(
             context, players, goalkeeper, store, allow_ball_search=False,
         )
         return
     if set_play == SetPlay.CORNER_KICK:
-        _act_normal(
-            context, players, goalkeeper, store, allow_ball_search=False,
-        )
+        _act_our_corner(context, players, goalkeeper, store)
         return
     if set_play == SetPlay.GOAL_KICK:
+        _clear_corner_tactic(store, "goal_kick_not_corner")
         _act_normal(
             context, players, goalkeeper, store, allow_ball_search=False,
         )
         return
+    _clear_corner_tactic(store, "own_set_play_not_corner")
     _act_normal(
         context, players, goalkeeper, store, allow_ball_search=False,
     )
@@ -5026,6 +5958,16 @@ def _act_ready(
 
     game = context.game
     our_kickoff = game is not None and game.kicking_team == context.team_id
+    opponent_kickoff = (
+        game is not None
+        and game.kicking_team != KICKING_TEAM_NONE
+        and game.kicking_team != context.team_id
+    )
+    if opponent_kickoff:
+        _clear_kickoff_tactic(store, "opponent_ready")
+        _act_opponent_kickoff_ready(context, players, goalkeeper)
+        return
+
     field = context.field
     if goalkeeper is not None:
         goalkeeper.action = (
@@ -5124,6 +6066,37 @@ def _act_ready(
     for player in field_players[len(ready_targets):]:
         player.action = "ready:hold"
         player.stop()
+
+
+def _act_opponent_kickoff_ready(
+    context: Context,
+    players: list[Player],
+    goalkeeper: Player | None,
+) -> None:
+    """Move to conservative kickoff slots under complete-segment rules."""
+    field = context.field
+    field_targets = [
+        (-field.circle_radius - CIRCLE_MARGIN_M - 0.6, 1.8),
+        (-field.circle_radius - CIRCLE_MARGIN_M - 0.6, -1.8),
+    ]
+    field_player_index = 0
+    for player in players:
+        if player is goalkeeper:
+            target = own_goal_area_center(context)
+            action = "opp_kickoff_ready:goalkeeper"
+        else:
+            target = field_targets[
+                min(field_player_index, len(field_targets) - 1)
+            ]
+            field_player_index += 1
+            action = "opp_kickoff_ready:position"
+        _walk_to_restart_target(
+            context,
+            player,
+            target,
+            action,
+            enforce_opponent_kickoff_rules=True,
+        )
 
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .framework.types import Context, Penalty, Pose2D
@@ -101,6 +102,13 @@ class Player:
         # 当前高层动作名(仅供可视化/调试)。策略分派层每帧写入;有子状态的动作
         # (如 guard)在方法内部细化。可视化 pass 读它标注文字,见 main.py。
         self.action: str = "init"
+        self.last_commanded_velocity: tuple[float, float, float] = (
+            0.0,
+            0.0,
+            0.0,
+        )
+        self.last_motion_target: tuple[float, float] | None = None
+        self.last_selected_waypoint: tuple[float, float] | None = None
 
         # SDK 缓存字段,框架后台会自动更新
         self._mode: str | None = None
@@ -196,6 +204,7 @@ class Player:
             vx *= scale
             vy *= scale
         vyaw = clamp(vyaw, -MAX_ANGULAR, MAX_ANGULAR)
+        self.last_commanded_velocity = (vx, vy, vyaw)
 
         if self._backend is None:
             _log.debug(
@@ -410,6 +419,9 @@ class Player:
         avoid_robots: bool = False,
         arrive_dist: float = ARRIVE_DIST,
         preserve_ball_approach: bool = False,
+        movement_segment_constraint: Callable[
+            [tuple[float, float], tuple[float, float]], bool
+        ] | None = None,
     ) -> bool:
         """走向目标点。返回是否已到达。
 
@@ -430,6 +442,8 @@ class Player:
             return False
 
         tx, ty = target
+        self.last_motion_target = (tx, ty)
+        self.last_selected_waypoint = None
         dx = tx - pose.x
         dy = ty - pose.y
         distance = math.hypot(dx, dy)
@@ -457,12 +471,30 @@ class Player:
         waypoint: tuple[float, float] | None = None
         obstacles: list = []
         selected_clearance = math.inf
-        if (avoid_ball or avoid_robots) and self.context is not None:
+        avoidance_requested = (
+            (avoid_ball or avoid_robots) and self.context is not None
+        )
+        if avoidance_requested:
             obstacles = collect_obstacles(
                 self.context, self.id,
                 ball=avoid_ball, robots=avoid_robots,
                 goals=(avoid_ball or avoid_robots),
             )
+        if movement_segment_constraint is not None:
+            constrained_plan = self._plan_constrained_heading(
+                pose,
+                goal_dir,
+                distance,
+                obstacles,
+                movement_segment_constraint,
+            )
+            if constrained_plan is None:
+                self.stop(
+                    preserve_ball_approach=preserve_ball_approach,
+                )
+                return False
+            heading, selected_clearance, waypoint = constrained_plan
+        elif avoidance_requested:
             if USE_GLOBAL_PATH_PLANNER:
                 planned_path = plan_global_path(
                     self.context,
@@ -486,6 +518,14 @@ class Player:
                 )
         else:
             heading = goal_dir
+
+        if waypoint is None:
+            waypoint_distance = min(distance, PLAN_LOOKAHEAD)
+            waypoint = (
+                pose.x + math.cos(heading) * waypoint_distance,
+                pose.y + math.sin(heading) * waypoint_distance,
+            )
+        self.last_selected_waypoint = waypoint
 
         # 可视化:目标点(绿)、到目标连线(灰)、规划朝向(黄箭头)、
         # 前方探测射线(青,长度=lookahead;规划器"看"的范围,无 path/途径点概念)
@@ -631,6 +671,45 @@ class Player:
             if clear > best_clear:
                 best_clear, best_h = clear, h
         return best_h, best_clear
+
+    def _plan_constrained_heading(
+        self,
+        pose: Pose2D,
+        goal_dir: float,
+        target_distance: float,
+        obstacles: list,
+        movement_segment_constraint: Callable[
+            [tuple[float, float], tuple[float, float]], bool
+        ],
+    ) -> tuple[float, float, tuple[float, float]] | None:
+        """Select a locally clear heading whose lookahead segment is legal."""
+        sign_first = 1.0 if self.id % 2 == 0 else -1.0
+        heading_offsets = [0.0]
+        offset_index = 1
+        while offset_index * PLAN_STEP <= PLAN_MAX_OFFSET + 1e-9:
+            heading_offsets.append(sign_first * offset_index * PLAN_STEP)
+            heading_offsets.append(-sign_first * offset_index * PLAN_STEP)
+            offset_index += 1
+
+        segment_length = min(target_distance, PLAN_LOOKAHEAD)
+        segment_start = (pose.x, pose.y)
+        for heading_offset in heading_offsets:
+            heading = goal_dir + heading_offset
+            selected_clearance = _heading_clearance(
+                pose.x,
+                pose.y,
+                heading,
+                obstacles,
+            )
+            if selected_clearance < PLAN_CLEARANCE:
+                continue
+            segment_end = (
+                pose.x + math.cos(heading) * segment_length,
+                pose.y + math.sin(heading) * segment_length,
+            )
+            if movement_segment_constraint(segment_start, segment_end):
+                return heading, selected_clearance, segment_end
+        return None
 
     # ------------------------------------------------------------------
     # 高层动作(策略在 main.py 里直接调这些)

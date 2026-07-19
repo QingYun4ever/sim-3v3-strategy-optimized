@@ -5032,27 +5032,43 @@ def _segment_axis_respects_bounds(
     return minimum_value - tolerance <= end_value <= maximum_value + tolerance
 
 
+def _axis_boundary_violation(
+    value: float,
+    minimum_value: float,
+    maximum_value: float,
+) -> float:
+    if value < minimum_value:
+        return minimum_value - value
+    if value > maximum_value:
+        return value - maximum_value
+    return 0.0
+
+
 def _opponent_kickoff_segment_is_safe(
     context: Context,
     segment_start: tuple[float, float],
     segment_end: tuple[float, float],
 ) -> bool:
-    """Keep legal segments legal and make every inherited violation improve."""
+    """Keep legal segments legal and monotonically correct inherited violations."""
     field_margin = 0.3
     half_length = max(0.0, context.field.length / 2.0 - field_margin)
     half_width = max(0.0, context.field.width / 2.0 - field_margin)
+    minimum_x = -half_length
+    maximum_x = -OPPONENT_KICKOFF_HALF_MARGIN_M
+    minimum_y = -half_width
+    maximum_y = half_width
     if not _segment_axis_respects_bounds(
         segment_start[0],
         segment_end[0],
-        -half_length,
-        -OPPONENT_KICKOFF_HALF_MARGIN_M,
+        minimum_x,
+        maximum_x,
     ):
         return False
     if not _segment_axis_respects_bounds(
         segment_start[1],
         segment_end[1],
-        -half_width,
-        half_width,
+        minimum_y,
+        maximum_y,
     ):
         return False
 
@@ -5061,6 +5077,30 @@ def _opponent_kickoff_segment_is_safe(
         segment_end[1] - segment_start[1],
     )
     tolerance = 1e-6
+    start_violations = [
+        _axis_boundary_violation(
+            segment_start[0],
+            minimum_x,
+            maximum_x,
+        ),
+        _axis_boundary_violation(
+            segment_start[1],
+            minimum_y,
+            maximum_y,
+        ),
+    ]
+    end_violations = [
+        _axis_boundary_violation(
+            segment_end[0],
+            minimum_x,
+            maximum_x,
+        ),
+        _axis_boundary_violation(
+            segment_end[1],
+            minimum_y,
+            maximum_y,
+        ),
+    ]
     for center, radius in _opponent_kickoff_forbidden_circles(context):
         start_offset = (
             segment_start[0] - center[0],
@@ -5088,6 +5128,23 @@ def _opponent_kickoff_segment_is_safe(
         )
         if outward_progress < -tolerance or end_distance <= start_distance:
             return False
+        start_violations.append(radius - start_distance)
+        end_violations.append(max(0.0, radius - end_distance))
+
+    for start_violation, end_violation in zip(
+        start_violations,
+        end_violations,
+    ):
+        if end_violation > start_violation + tolerance:
+            return False
+
+    total_start_violation = sum(start_violations)
+    total_end_violation = sum(end_violations)
+    if (
+        total_start_violation > tolerance
+        and total_end_violation >= total_start_violation - tolerance
+    ):
+        return False
     return True
 
 
@@ -5283,14 +5340,15 @@ def _select_corner_receive_target(
     opponent_goal_x, opponent_goal_y = opponent_goal(context)
     penalty_length = context.field.penalty_area_length
     penalty_half_width = context.field.penalty_area_width / 2.0
+    penalty_front_edge_x = opponent_goal_x - penalty_length
     candidate_targets = [
-        (opponent_goal_x - penalty_length * 0.65, side_sign * 0.45),
-        (opponent_goal_x - penalty_length * 0.80, side_sign * 1.05),
-        (opponent_goal_x - penalty_length * 0.55, 0.0),
-        (opponent_goal_x - penalty_length * 0.95, -side_sign * 0.35),
+        (penalty_front_edge_x, side_sign * 0.45),
+        (penalty_front_edge_x, 0.0),
+        (penalty_front_edge_x, side_sign * 0.85),
+        (penalty_front_edge_x + 0.25, -side_sign * 0.30),
         (
-            opponent_goal_x - penalty_length * 0.70,
-            side_sign * min(penalty_half_width * 0.75, 1.6),
+            penalty_front_edge_x + 0.15,
+            side_sign * min(penalty_half_width * 0.50, 1.1),
         ),
     ]
 
@@ -5316,8 +5374,9 @@ def _select_corner_receive_target(
                 target[0],
                 target[1],
             )
-        central_lane_bonus = 0.6 if abs(target[1]) <= penalty_half_width else 0.0
-        score = central_lane_bonus - receiver_cost
+        front_edge_bonus = 0.8 if abs(target[0] - penalty_front_edge_x) <= 0.20 else 0.0
+        central_lane_bonus = 0.6 if abs(target[1]) <= penalty_half_width * 0.60 else 0.0
+        score = front_edge_bonus + central_lane_bonus - receiver_cost
         if pass_clearance is not None:
             score += min(pass_clearance, 2.5)
         else:
@@ -5464,7 +5523,7 @@ def _command_corner_touch(
     ))
     ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
     close_corner_touch = (
-        action_prefix == "corner:passer"
+        action_prefix in ("corner:passer", "corner:single_safe_touch")
         and ball_distance <= CORNER_PASSER_CLOSE_TOUCH_M
     )
 
@@ -5508,10 +5567,6 @@ def _corner_ball_has_moved_toward_receive(
     start_seen_at = getattr(store, "corner_pass_start_seen_at", None)
     if ball is None or start_seen_at is None:
         return False
-    ball_seen_at = ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
-    if ball_seen_at <= start_seen_at:
-        return False
-
     moved_x = ball.x - start_ball[0]
     moved_y = ball.y - start_ball[1]
     moved_distance = math.hypot(moved_x, moved_y)
@@ -5714,23 +5769,18 @@ def _act_our_corner(
     state = getattr(store, "corner_tactic_state", CornerTacticState.IDLE)
     state_entered_at = getattr(store, "corner_state_entered_at", context.now)
     if state == CornerTacticState.PASS:
-        if getattr(store, "corner_pass_commanded", False):
-            kicked = False
-            passer.action = "corner:passer_wait_ball_move"
-            passer.stop()
-        else:
-            kicked = _command_corner_touch(
-                passer,
-                roles.receive_target,
-                CORNER_PASS_POWER,
-                "corner:passer",
-                kick_distance=CORNER_PASS_KICK_DISTANCE_M,
-                alignment_tolerance=CORNER_PASS_ALIGNMENT_RAD,
-                ball_bearing_tolerance=CORNER_PASS_BALL_BEARING_RAD,
-                approach_behind=CORNER_PASS_APPROACH_BEHIND_M,
-            )
-            if kicked:
-                store.corner_pass_commanded = True
+        kicked = _command_corner_touch(
+            passer,
+            roles.receive_target,
+            CORNER_PASS_POWER,
+            "corner:passer",
+            kick_distance=CORNER_PASS_KICK_DISTANCE_M,
+            alignment_tolerance=CORNER_PASS_ALIGNMENT_RAD,
+            ball_bearing_tolerance=CORNER_PASS_BALL_BEARING_RAD,
+            approach_behind=CORNER_PASS_APPROACH_BEHIND_M,
+        )
+        if kicked:
+            store.corner_pass_commanded = True
         if receiver is not None:
             shot_face = angle_to(
                 receiver.pose.x,

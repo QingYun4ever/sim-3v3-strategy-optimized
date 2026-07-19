@@ -217,6 +217,8 @@ class Player:
     def stop(self, *, preserve_ball_approach: bool = False) -> None:
         if not preserve_ball_approach:
             self._reset_ball_approach()
+        self.last_motion_target = None
+        self.last_selected_waypoint = None
         self.release_kick()
         self.set_velocity(0.0, 0.0, 0.0)
 

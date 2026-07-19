@@ -304,6 +304,9 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.kickoff_pass_start_seen_at = None
         store.kickoff_pass_attempts = 0
         store.kickoff_last_pass_attempt_at = None
+        store.kickoff_shot_start_ball = None
+        store.kickoff_shot_start_seen_at = None
+        store.kickoff_shot_attempts = 0
         store.kickoff_abort_reason = None
         store.kickoff_ready_passer_arrived = False
         store.kickoff_ready_shooter_arrived = False
@@ -3800,6 +3803,9 @@ def _clear_kickoff_tactic(store, reason: str) -> None:
     store.kickoff_pass_start_seen_at = None
     store.kickoff_pass_attempts = 0
     store.kickoff_last_pass_attempt_at = None
+    store.kickoff_shot_start_ball = None
+    store.kickoff_shot_start_seen_at = None
+    store.kickoff_shot_attempts = 0
     store.kickoff_abort_reason = reason
     store.kickoff_ready_passer_arrived = False
     store.kickoff_ready_shooter_arrived = False
@@ -3830,10 +3836,14 @@ def _kickoff_layout_for_side(
     side_sign: float,
 ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """返回镜像后的 passer setup、shooter setup 和接应点。"""
+    legal_setup_x = min(
+        KICKOFF_PASSER_SETUP_X_M,
+        -context.field.circle_radius - KICKOFF_CENTER_CIRCLE_CLEARANCE_M,
+    )
     passer_setup = _kickoff_clamp_target(
         context,
         (
-            KICKOFF_PASSER_SETUP_X_M,
+            legal_setup_x,
             KICKOFF_PASSER_SETUP_Y_M * side_sign,
         ),
     )
@@ -3960,6 +3970,9 @@ def _initialize_our_kickoff_tactic(
     store.kickoff_last_pass_attempt_at = None
     store.kickoff_pass_start_ball = None
     store.kickoff_pass_start_seen_at = None
+    store.kickoff_shot_start_ball = None
+    store.kickoff_shot_start_seen_at = None
+    store.kickoff_shot_attempts = 0
     store.kickoff_abort_reason = None
     store.kickoff_ready_passer_arrived = False
     store.kickoff_ready_shooter_arrived = False
@@ -4495,8 +4508,21 @@ def _act_our_kickoff(
                     _enter_kickoff_state(store, KickoffTacticState.PASS, context.now)
                 else:
                     _abort_kickoff_tactic(context, store, "first_touch_timeout")
-            passer.action = "kickoff:verify_first_touch"
-            passer.stop()
+            ball = context.ball
+            if ball is not None:
+                pass_direction = angle_to(
+                    ball.x,
+                    ball.y,
+                    roles.receive_target[0],
+                    roles.receive_target[1],
+                )
+                # SDK kick 是持续动作；确认球移动前必须跨帧保持命令，不能
+                # stop()/release_kick()，否则踢腿刚启动就会被下一帧取消。
+                passer.kick(pass_direction, KICKOFF_PASS_POWER)
+                passer.action = "kickoff:verify_first_touch:kicking"
+            else:
+                passer.action = "kickoff:verify_first_touch:no_ball"
+                passer.stop()
             shooter.walk_to(
                 roles.receive_target,
                 face=angle_to(
@@ -4546,7 +4572,14 @@ def _act_our_kickoff(
                     approach_behind=KICKOFF_PASS_APPROACH_BEHIND_M,
                 )
                 if kicked:
-                    store.kickoff_second_touch_confirmed = True
+                    ball = context.ball
+                    if ball is not None:
+                        store.kickoff_shot_start_ball = (ball.x, ball.y)
+                        store.kickoff_shot_start_seen_at = (
+                            ball.last_seen_at
+                            if ball.last_seen_at > 0.0 else context.now
+                        )
+                    store.kickoff_shot_attempts += 1
                     _enter_kickoff_state(
                         store,
                         KickoffTacticState.VERIFY_SECOND_TOUCH,
@@ -4569,8 +4602,64 @@ def _act_our_kickoff(
         return
 
     if state == KickoffTacticState.VERIFY_SECOND_TOUCH:
-        _complete_kickoff_tactic(context, store)
-        _act_normal(context, players, goalkeeper, store)
+        ball = context.ball
+        shot_start = getattr(store, "kickoff_shot_start_ball", None)
+        shot_seen_at = getattr(store, "kickoff_shot_start_seen_at", None)
+        ball_seen_at = (
+            ball.last_seen_at
+            if ball is not None and ball.last_seen_at > 0.0 else context.now
+        )
+        shot_moved = (
+            ball is not None
+            and shot_start is not None
+            and shot_seen_at is not None
+            and ball_seen_at > shot_seen_at
+            and dist(
+                ball.x,
+                ball.y,
+                shot_start[0],
+                shot_start[1],
+            ) >= KICKOFF_BALL_MOVED_DISTANCE_M
+        )
+        if shot_moved:
+            store.kickoff_second_touch_confirmed = True
+            _complete_kickoff_tactic(context, store)
+            _act_normal(context, players, goalkeeper, store)
+            return
+
+        if ball is not None:
+            shot_direction = angle_to(
+                ball.x,
+                ball.y,
+                *opponent_goal(context),
+            )
+            shooter.kick(shot_direction, KICKOFF_SHOT_POWER)
+            shooter.action = "kickoff:verify_second_touch:kicking"
+        _act_kickoff_passer_protect(context, passer, roles)
+
+        second_touch_timed_out = (
+            state_entered_at is not None
+            and context.now - state_entered_at
+            > KICKOFF_SECOND_TOUCH_TIMEOUT_SEC
+        )
+        if second_touch_timed_out:
+            shooter.release_kick()
+            if (
+                getattr(store, "kickoff_shot_attempts", 0)
+                < KICKOFF_SHOT_MAX_RETRIES
+            ):
+                _enter_kickoff_state(
+                    store,
+                    KickoffTacticState.RECEIVE_AND_SHOOT,
+                    context.now,
+                )
+            else:
+                _abort_kickoff_tactic(
+                    context,
+                    store,
+                    "second_touch_timeout",
+                )
+        _draw_kickoff_tactic(context, store)
         return
 
     if state == KickoffTacticState.ABORT_BEFORE_FIRST_TOUCH:
@@ -4898,16 +4987,18 @@ def _act_ready(
                 store.kickoff_ready_passer_arrived = passer.walk_to(
                     roles.passer_setup,
                     face=pass_face,
-                    avoid_ball=True,
-                    avoid_robots=True,
+                    # READY 使用己方半场内的直接路径，避免全局规划器为绕障
+                    # 临时跨越中线或切入中圈造成 ILLEGAL_POSITIONING。
+                    avoid_ball=False,
+                    avoid_robots=False,
                     arrive_dist=KICKOFF_READY_ARRIVE_M,
                 )
                 passer.action = "kickoff:passer_setup"
                 store.kickoff_ready_shooter_arrived = shooter.walk_to(
                     roles.shooter_setup,
                     face=shot_face,
-                    avoid_ball=True,
-                    avoid_robots=True,
+                    avoid_ball=False,
+                    avoid_robots=False,
                     arrive_dist=KICKOFF_READY_ARRIVE_M,
                 )
                 shooter.action = "kickoff:shooter_setup"

@@ -24,7 +24,7 @@ KICK_POWER_OUR_KICKOFF = 5.0
 
 # 我方中场固定开球专用力度。传球和二脚射门需要分别仿真标定，不能复用
 # 普通射门、后场解围或守门员解围力度。
-KICKOFF_PASS_POWER = 1.6
+KICKOFF_PASS_POWER = 1.2
 KICKOFF_SHOT_POWER = 6.5
 
 

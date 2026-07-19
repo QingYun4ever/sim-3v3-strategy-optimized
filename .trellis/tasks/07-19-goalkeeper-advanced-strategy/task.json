@@ -1,7 +1,7 @@
 {
-  "id": "full-strategy-implementation-plan",
-  "name": "full-strategy-implementation-plan",
-  "title": "完整理解策略并制定实现规划",
+  "id": "goalkeeper-advanced-strategy",
+  "name": "goalkeeper-advanced-strategy",
+  "title": "守门员动态站位、封堵、出击、解围与回位",
   "description": "",
   "status": "in_progress",
   "dev_type": null,
@@ -18,10 +18,8 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [
-    "07-19-goalkeeper-advanced-strategy"
-  ],
-  "parent": null,
+  "children": [],
+  "parent": "07-19-full-strategy-implementation-plan",
   "relatedFiles": [],
   "notes": "",
   "meta": {}

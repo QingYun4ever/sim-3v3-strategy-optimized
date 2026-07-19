@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "The advanced goalkeeper must centralize shared guard dispatch and avoid duplicating threat and role checks across ATTACKING, DEFENDING, and CONTESTED branches."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Trace Context ball/opponent observations into store-based velocity and goalkeeper actions without modifying framework data contracts."}
+{"file": ".trellis/tasks/07-19-availability-degraded-roster/design.md", "reason": "Preserve the existing default/temporary goalkeeper identity state machine, safe-window handover, and degraded-roster contracts."}
+{"file": ".trellis/tasks/archive/2026-07/07-19-match-state-restart-safety/design.md", "reason": "Keep opponent restart movement isolated from normal goalkeeper challenge and clearance behavior."}

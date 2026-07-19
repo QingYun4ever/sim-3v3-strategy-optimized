@@ -61,6 +61,17 @@ class OpenPlayMode(Enum):
     CONTESTED = "contested"
 
 
+class GoalkeeperMode(Enum):
+    """普通 live play 中的守门员战术状态。"""
+
+    HOLD = "hold"
+    TRACK = "track"
+    BLOCK = "block"
+    CHALLENGE = "challenge"
+    CLEAR = "clear"
+    RETURN = "return"
+
+
 class OpenPlayAvailability(Enum):
     """普通比赛角色分配可使用的机器人数量。"""
 
@@ -91,6 +102,16 @@ class OpenPlayModeEstimate:
     opponent_nearest_ball_distance: float | None
     distance_advantage: float | None
     ball_in_own_danger_area: bool
+
+
+@dataclass(frozen=True)
+class GoalkeeperThreatEstimate:
+    """守门员使用的可解释射门威胁估计。"""
+
+    fast_goal_threat: bool
+    position_threat: bool
+    projected_goal_y: float | None
+    reason: str
 
 
 def get_phase(context: Context) -> Phase:
@@ -183,6 +204,17 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.open_play_our_ball_distance = None
         store.open_play_opponent_ball_distance = None
         store.open_play_distance_advantage = None
+        store.goalkeeper_strategy_player_id = None
+        store.goalkeeper_mode = None
+        store.goalkeeper_mode_entered_at = None
+        store.goalkeeper_challenge_started_at = None
+        store.goalkeeper_threat_reason = "inactive"
+        store.goalkeeper_previous_ball_position = None
+        store.goalkeeper_previous_ball_sample_at = None
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        store.goalkeeper_target = None
+        store.goalkeeper_clearance_target = None
         store.player_availability = {}
         store.available_player_ids = ()
         store.default_goalkeeper_id = None
@@ -231,6 +263,8 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             phase,
             store,
         )
+        if current_goalkeeper is None or store.prev_phase != phase:
+            _reset_goalkeeper_strategy(store)
 
         # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
         if phase == Phase.NORMAL:
@@ -396,6 +430,21 @@ def _clear_normal_sticky(store) -> None:
     store.open_play_our_ball_distance = None
     store.open_play_opponent_ball_distance = None
     store.open_play_distance_advantage = None
+
+
+def _reset_goalkeeper_strategy(store) -> None:
+    """清除 phase 或守门员身份相关的高级守门跨帧状态。"""
+    store.goalkeeper_strategy_player_id = None
+    store.goalkeeper_mode = None
+    store.goalkeeper_mode_entered_at = None
+    store.goalkeeper_challenge_started_at = None
+    store.goalkeeper_threat_reason = "inactive"
+    store.goalkeeper_previous_ball_position = None
+    store.goalkeeper_previous_ball_sample_at = None
+    store.goalkeeper_ball_velocity = None
+    store.goalkeeper_ball_speed = None
+    store.goalkeeper_target = None
+    store.goalkeeper_clearance_target = None
 
 
 def _player_dist_to_ball(context: Context, p: Player) -> float:
@@ -740,17 +789,6 @@ def _act_normal_attacking_shape(
     store,
 ) -> None:
     """执行普通比赛双前场进攻形态及安全人数降级。"""
-    if goalkeeper is not None:
-        goalkeeper.guard()
-        goalkeeper_kind = (
-            "temporary"
-            if goalkeeper.id == getattr(
-                store, "temporary_goalkeeper_id", None,
-            )
-            else "default"
-        )
-        goalkeeper.action = f"attack:goalkeeper:{goalkeeper_kind}"
-
     if primary_attacker is None:
         return
     if front_partner is None:
@@ -833,6 +871,664 @@ def _ball_in_own_danger_area(context: Context) -> bool:
         <= own_goal_line_x + OPEN_PLAY_IMMEDIATE_GOAL_DANGER_DEPTH_M
     )
     return in_penalty_channel or immediately_near_goal
+
+
+def _goalkeeper_safe_lateral_limit(context: Context) -> float:
+    """返回门柱内侧的守门员最大横向站位。"""
+    goal_limited_lateral = max(
+        0.0,
+        context.field.goal_width / 2.0 - GOALKEEPER_POST_MARGIN_M,
+    )
+    return min(GOALKEEPER_MAX_LATERAL_M, goal_limited_lateral)
+
+
+def _get_goalkeeper_home_target(context: Context) -> tuple[float, float]:
+    """根据球到己方门的距离计算远近不同增益的动态门前目标。"""
+    own_goal_x, _own_goal_y = own_goal(context)
+    home_x = own_goal_x + GOALKEEPER_HOME_X_OFFSET_M
+    ball = context.ball
+    if ball is None:
+        return (home_x, 0.0)
+
+    ball_goal_distance = max(0.0, ball.x - own_goal_x)
+    near_weight = 1.0 - clamp(
+        ball_goal_distance / max(GOALKEEPER_TRACK_NEAR_DISTANCE_M, 1e-6),
+        0.0,
+        1.0,
+    )
+    tracking_gain = (
+        GOALKEEPER_TRACK_GAIN_FAR
+        + (GOALKEEPER_TRACK_GAIN_NEAR - GOALKEEPER_TRACK_GAIN_FAR)
+        * near_weight
+    )
+    lateral_limit = _goalkeeper_safe_lateral_limit(context)
+    home_y = clamp(
+        ball.y * tracking_gain,
+        -lateral_limit,
+        lateral_limit,
+    )
+    return (home_x, home_y)
+
+
+def _estimate_goalkeeper_ball_velocity(
+    context: Context,
+    store,
+) -> tuple[float, float] | None:
+    """以新球观测做有限差分；异常样本只重播种，不输出速度。"""
+    ball = context.ball
+    if ball is None:
+        store.goalkeeper_previous_ball_position = None
+        store.goalkeeper_previous_ball_sample_at = None
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        return None
+
+    sample_at = ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
+    current_position = (ball.x, ball.y)
+    previous_position = getattr(
+        store, "goalkeeper_previous_ball_position", None,
+    )
+    previous_sample_at = getattr(
+        store, "goalkeeper_previous_ball_sample_at", None,
+    )
+
+    if previous_position is None or previous_sample_at is None:
+        store.goalkeeper_previous_ball_position = current_position
+        store.goalkeeper_previous_ball_sample_at = sample_at
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        return None
+
+    sample_interval = sample_at - previous_sample_at
+    if sample_interval <= 0.0:
+        velocity_age = max(0.0, context.now - previous_sample_at)
+        if velocity_age <= GOALKEEPER_BALL_VELOCITY_MAX_AGE_SEC:
+            return getattr(store, "goalkeeper_ball_velocity", None)
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        return None
+
+    displacement = dist(
+        previous_position[0],
+        previous_position[1],
+        current_position[0],
+        current_position[1],
+    )
+    store.goalkeeper_previous_ball_position = current_position
+    store.goalkeeper_previous_ball_sample_at = sample_at
+
+    valid_sample_interval = (
+        GOALKEEPER_BALL_SAMPLE_MIN_SEC
+        <= sample_interval
+        <= GOALKEEPER_BALL_SAMPLE_MAX_SEC
+    )
+    if (
+        not valid_sample_interval
+        or displacement > GOALKEEPER_BALL_SAMPLE_MAX_JUMP_M
+    ):
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        return None
+
+    velocity_x = (current_position[0] - previous_position[0]) / sample_interval
+    velocity_y = (current_position[1] - previous_position[1]) / sample_interval
+    ball_speed = math.hypot(velocity_x, velocity_y)
+    if ball_speed > GOALKEEPER_BALL_MAX_CREDIBLE_SPEED_MPS:
+        store.goalkeeper_ball_velocity = None
+        store.goalkeeper_ball_speed = None
+        return None
+
+    velocity = (velocity_x, velocity_y)
+    store.goalkeeper_ball_velocity = velocity
+    store.goalkeeper_ball_speed = ball_speed
+    return velocity
+
+
+def _estimate_goalkeeper_threat(
+    context: Context,
+    ball_velocity: tuple[float, float] | None,
+    opponent_nearest_distance: float | None,
+) -> GoalkeeperThreatEstimate:
+    """判断快速射门投影或无可靠速度时的保守门前位置威胁。"""
+    ball = context.ball
+    if ball is None:
+        return GoalkeeperThreatEstimate(False, False, None, "ball_unknown")
+
+    own_goal_x, _own_goal_y = own_goal(context)
+    goal_projection_limit = (
+        context.field.goal_width / 2.0
+        + GOALKEEPER_SHOT_PROJECTION_MARGIN_M
+    )
+    if ball_velocity is not None:
+        velocity_x, velocity_y = ball_velocity
+        ball_speed = math.hypot(velocity_x, velocity_y)
+        moving_toward_goal = velocity_x <= -GOALKEEPER_GOALWARD_VX_MPS
+        if moving_toward_goal and ball.x > own_goal_x:
+            time_to_goal_line = (own_goal_x - ball.x) / velocity_x
+            projected_goal_y = ball.y + velocity_y * time_to_goal_line
+            fast_goal_threat = (
+                ball.x < 0.0
+                and ball_speed >= GOALKEEPER_FAST_BALL_SPEED_MPS
+                and time_to_goal_line >= 0.0
+                and abs(projected_goal_y) <= goal_projection_limit
+            )
+            if fast_goal_threat:
+                return GoalkeeperThreatEstimate(
+                    True,
+                    True,
+                    projected_goal_y,
+                    "fast_shot_projection",
+                )
+
+    opponent_can_shoot = (
+        opponent_nearest_distance is not None
+        and opponent_nearest_distance
+        <= GOALKEEPER_POSITION_THREAT_OPPONENT_DISTANCE_M
+    )
+    ball_in_shooting_channel = (
+        ball.x <= GOALKEEPER_POSITION_THREAT_X_M
+        and abs(ball.y) <= GOALKEEPER_POSITION_THREAT_LATERAL_M
+    )
+    position_threat = (
+        ball_in_shooting_channel
+        and (opponent_can_shoot or _ball_in_own_danger_area(context))
+    )
+    return GoalkeeperThreatEstimate(
+        False,
+        position_threat,
+        None,
+        "position_threat" if position_threat else "no_direct_threat",
+    )
+
+
+def _get_goalkeeper_block_target(
+    context: Context,
+    ball_velocity: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """计算球运动射线在门前封堵 X 上的交点。"""
+    own_goal_x, _own_goal_y = own_goal(context)
+    block_x = own_goal_x + GOALKEEPER_BLOCK_X_OFFSET_M
+    home_target = _get_goalkeeper_home_target(context)
+    block_y = home_target[1]
+    ball = context.ball
+    if ball is not None and ball_velocity is not None:
+        velocity_x, velocity_y = ball_velocity
+        if velocity_x < -1e-6 and ball.x > block_x:
+            time_to_block_x = (block_x - ball.x) / velocity_x
+            if time_to_block_x >= 0.0:
+                block_y = ball.y + velocity_y * time_to_block_x
+
+    lateral_limit = _goalkeeper_safe_lateral_limit(context)
+    return (
+        block_x,
+        clamp(block_y, -lateral_limit, lateral_limit),
+    )
+
+
+def _goalkeeper_can_challenge(
+    context: Context,
+    goalkeeper: Player,
+    opponent_nearest_distance: float | None,
+    ball_speed: float | None,
+    field_player_count: int,
+    current_mode: GoalkeeperMode | None,
+) -> bool:
+    """仅在慢球、对手数据有效且守门员明确先到时允许出击。"""
+    ball = context.ball
+    pose = goalkeeper.pose
+    if (
+        ball is None
+        or pose is None
+        or opponent_nearest_distance is None
+        or field_player_count < 2
+    ):
+        return False
+
+    distance_limit = (
+        GOALKEEPER_CHALLENGE_EXIT_DISTANCE_M
+        if current_mode == GoalkeeperMode.CHALLENGE
+        else GOALKEEPER_CHALLENGE_ENTER_DISTANCE_M
+    )
+    goalkeeper_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    ball_is_slow_enough = (
+        ball_speed is None or ball_speed <= GOALKEEPER_SLOW_BALL_SPEED_MPS
+    )
+    ball_in_challenge_area = (
+        ball.x <= GOALKEEPER_CHALLENGE_MAX_X_M
+        and abs(ball.y) <= GOALKEEPER_CHALLENGE_MAX_LATERAL_M
+    )
+    goalkeeper_arrives_first = (
+        goalkeeper_distance + GOALKEEPER_CHALLENGE_ADVANTAGE_M
+        < opponent_nearest_distance
+    )
+    return (
+        ball_is_slow_enough
+        and ball_in_challenge_area
+        and goalkeeper_distance <= distance_limit
+        and goalkeeper_arrives_first
+    )
+
+
+def _point_to_segment_distance(
+    point: tuple[float, float],
+    segment_start: tuple[float, float],
+    segment_end: tuple[float, float],
+) -> float:
+    """返回点到线段的最短距离，用于选择较空的解围走廊。"""
+    segment_x = segment_end[0] - segment_start[0]
+    segment_y = segment_end[1] - segment_start[1]
+    segment_length_squared = segment_x * segment_x + segment_y * segment_y
+    if segment_length_squared <= 1e-9:
+        return dist(point[0], point[1], segment_start[0], segment_start[1])
+
+    projection = (
+        (point[0] - segment_start[0]) * segment_x
+        + (point[1] - segment_start[1]) * segment_y
+    ) / segment_length_squared
+    projection = clamp(projection, 0.0, 1.0)
+    nearest_x = segment_start[0] + segment_x * projection
+    nearest_y = segment_start[1] + segment_y * projection
+    return dist(point[0], point[1], nearest_x, nearest_y)
+
+
+def _get_safe_goalkeeper_clearance_target(
+    context: Context,
+) -> tuple[float, float] | None:
+    """从全部正 X 候选中选择对手走廊净空最大的前场或边路目标。"""
+    ball = context.ball
+    if ball is None:
+        return None
+
+    half_length = (
+        context.field.length / 2.0 - GOALKEEPER_CLEAR_FIELD_MARGIN_M
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - GOALKEEPER_CLEAR_FIELD_MARGIN_M,
+    )
+    if half_length <= ball.x:
+        return None
+
+    minimum_target_x = min(ball.x + 0.5, half_length)
+    target_x = clamp(
+        ball.x + GOALKEEPER_CLEAR_FORWARD_DISTANCE_M,
+        minimum_target_x,
+        half_length,
+    )
+    center_target_y = clamp(
+        ball.y * 0.35,
+        -min(half_width, GOALKEEPER_CLEAR_CENTER_BAND_M),
+        min(half_width, GOALKEEPER_CLEAR_CENTER_BAND_M),
+    )
+    side_target_y = min(
+        half_width,
+        max(abs(ball.y), GOALKEEPER_CLEAR_LATERAL_DISTANCE_M),
+    )
+    candidates = [
+        (target_x, center_target_y),
+        (target_x, side_target_y),
+        (target_x, -side_target_y),
+    ]
+    opponent_positions = [
+        (robot.pose.x, robot.pose.y)
+        for robot in context.opponents.values()
+        if robot.pose is not None
+    ]
+    if not opponent_positions:
+        return candidates[0]
+
+    ball_position = (ball.x, ball.y)
+
+    def corridor_clearance(candidate: tuple[float, float]) -> float:
+        return min(
+            _point_to_segment_distance(
+                opponent_position,
+                ball_position,
+                candidate,
+            )
+            for opponent_position in opponent_positions
+        )
+
+    return max(candidates, key=corridor_clearance)
+
+
+def _goalkeeper_has_returned(
+    goalkeeper: Player,
+    home_target: tuple[float, float],
+) -> bool:
+    pose = goalkeeper.pose
+    return (
+        pose is not None
+        and dist(pose.x, pose.y, home_target[0], home_target[1])
+        <= GOALKEEPER_RETURN_ARRIVE_M
+    )
+
+
+def _update_goalkeeper_mode(
+    context: Context,
+    goalkeeper: Player,
+    threat: GoalkeeperThreatEstimate,
+    can_challenge: bool,
+    ball_clearable: bool,
+    home_target: tuple[float, float],
+    allow_active_response: bool,
+    store,
+) -> GoalkeeperMode:
+    """按快速封堵优先级、迟滞和超时更新守门员模式。"""
+    current_mode = getattr(store, "goalkeeper_mode", None)
+    mode_entered_at = getattr(store, "goalkeeper_mode_entered_at", None)
+    challenge_started_at = getattr(
+        store, "goalkeeper_challenge_started_at", None,
+    )
+    mode_elapsed = (
+        math.inf
+        if mode_entered_at is None
+        else max(0.0, context.now - mode_entered_at)
+    )
+    challenge_timed_out = (
+        current_mode == GoalkeeperMode.CHALLENGE
+        and challenge_started_at is not None
+        and context.now - challenge_started_at
+        >= GOALKEEPER_CHALLENGE_TIMEOUT_SEC
+    )
+    clear_timed_out = (
+        current_mode == GoalkeeperMode.CLEAR
+        and mode_elapsed >= GOALKEEPER_CLEAR_TIMEOUT_SEC
+    )
+
+    ball = context.ball
+    if not allow_active_response:
+        candidate_mode = (
+            GoalkeeperMode.HOLD if ball is None else GoalkeeperMode.TRACK
+        )
+        reason = "conservative_restart"
+    elif threat.fast_goal_threat:
+        candidate_mode = GoalkeeperMode.BLOCK
+        reason = threat.reason
+    elif challenge_timed_out:
+        candidate_mode = GoalkeeperMode.RETURN
+        reason = "challenge_timeout"
+    elif clear_timed_out:
+        candidate_mode = GoalkeeperMode.RETURN
+        reason = "clear_timeout"
+    elif (
+        current_mode == GoalkeeperMode.CLEAR
+        and mode_elapsed < GOALKEEPER_CLEAR_MIN_HOLD_SEC
+    ):
+        candidate_mode = GoalkeeperMode.CLEAR
+        reason = "clear_min_hold"
+    elif current_mode == GoalkeeperMode.RETURN and not _goalkeeper_has_returned(
+        goalkeeper, home_target,
+    ):
+        if threat.position_threat:
+            candidate_mode = GoalkeeperMode.BLOCK
+            reason = threat.reason
+        else:
+            candidate_mode = GoalkeeperMode.RETURN
+            reason = "returning_home"
+    elif ball_clearable:
+        candidate_mode = GoalkeeperMode.CLEAR
+        reason = "danger_ball_in_clear_range"
+    elif can_challenge:
+        candidate_mode = GoalkeeperMode.CHALLENGE
+        reason = "goalkeeper_arrives_first"
+    elif threat.position_threat:
+        candidate_mode = GoalkeeperMode.BLOCK
+        reason = threat.reason
+    elif current_mode in (GoalkeeperMode.CHALLENGE, GoalkeeperMode.CLEAR):
+        candidate_mode = GoalkeeperMode.RETURN
+        reason = "active_condition_ended"
+    elif ball is not None and ball.x <= OPEN_PLAY_CONTESTED_BAND_M:
+        candidate_mode = GoalkeeperMode.TRACK
+        reason = "track_visible_ball"
+    else:
+        candidate_mode = GoalkeeperMode.HOLD
+        reason = "hold_safe_area"
+
+    returning_into_position_threat = (
+        current_mode == GoalkeeperMode.RETURN
+        and threat.position_threat
+    )
+    active_mode_lost_ball = (
+        ball is None
+        and current_mode in (
+            GoalkeeperMode.BLOCK,
+            GoalkeeperMode.CHALLENGE,
+            GoalkeeperMode.CLEAR,
+        )
+    )
+    force_switch = (
+        not allow_active_response
+        or threat.fast_goal_threat
+        or ball_clearable
+        or challenge_timed_out
+        or clear_timed_out
+        or returning_into_position_threat
+        or active_mode_lost_ball
+    )
+    held_long_enough = (
+        current_mode is None
+        or mode_elapsed >= GOALKEEPER_MODE_MIN_HOLD_SEC
+    )
+    if (
+        current_mode is None
+        or (
+            candidate_mode != current_mode
+            and (force_switch or held_long_enough)
+        )
+    ):
+        previous_mode = current_mode
+        current_mode = candidate_mode
+        store.goalkeeper_mode = current_mode
+        store.goalkeeper_mode_entered_at = context.now
+        if current_mode == GoalkeeperMode.CHALLENGE:
+            store.goalkeeper_challenge_started_at = context.now
+        else:
+            store.goalkeeper_challenge_started_at = None
+        _log.info(
+            "goalkeeper mode %s -> %s reason=%s",
+            previous_mode.value if previous_mode is not None else "none",
+            current_mode.value,
+            reason,
+        )
+    elif candidate_mode != current_mode:
+        reason = "hold_hysteresis"
+
+    store.goalkeeper_threat_reason = reason
+    return current_mode
+
+
+def _draw_goalkeeper_strategy(
+    context: Context,
+    goalkeeper: Player,
+    mode: GoalkeeperMode,
+    target: tuple[float, float],
+    threat: GoalkeeperThreatEstimate,
+    clearance_target: tuple[float, float] | None,
+    store,
+) -> None:
+    """显示守门模式、动态目标、可靠射门线和解围目标。"""
+    from .framework import debugdraw
+
+    debugdraw.point(
+        target[0], target[1],
+        rgb=(0.0, 0.8, 1.0), scale=0.22, ns="goalkeeper_target",
+    )
+    ball = context.ball
+    if ball is not None and threat.projected_goal_y is not None:
+        own_goal_x, _own_goal_y = own_goal(context)
+        debugdraw.line(
+            [(ball.x, ball.y), (own_goal_x, threat.projected_goal_y)],
+            rgb=(1.0, 0.3, 0.0), ns="goalkeeper_shot_line",
+        )
+    if ball is not None and clearance_target is not None:
+        debugdraw.line(
+            [(ball.x, ball.y), clearance_target],
+            rgb=(0.2, 1.0, 0.4), ns="goalkeeper_clearance",
+        )
+        debugdraw.point(
+            clearance_target[0], clearance_target[1],
+            rgb=(0.2, 1.0, 0.4), scale=0.18,
+            ns="goalkeeper_clearance_target",
+        )
+
+    goalkeeper_kind = (
+        "temporary"
+        if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None)
+        else "default"
+    )
+    speed = getattr(store, "goalkeeper_ball_speed", None)
+    speed_label = "n/a" if speed is None else f"{speed:.2f}"
+    debugdraw.text(
+        0.0,
+        context.field.width / 2.0 + 0.9,
+        (
+            f"goalkeeper={goalkeeper_kind} mode={mode.value} "
+            f"reason={store.goalkeeper_threat_reason} speed={speed_label}"
+        ),
+        rgb=(0.2, 0.8, 1.0),
+        ns="goalkeeper_mode",
+    )
+
+
+def _act_goalkeeper_strategy(
+    context: Context,
+    goalkeeper: Player,
+    field_players: list[Player],
+    store,
+    *,
+    allow_active_response: bool,
+) -> None:
+    """统一执行默认或临时守门员的动态站位和高级动作。"""
+    if goalkeeper.pose is None:
+        goalkeeper.action = "goalkeeper:no_pose"
+        goalkeeper.stop()
+        return
+
+    if getattr(store, "goalkeeper_strategy_player_id", None) != goalkeeper.id:
+        _reset_goalkeeper_strategy(store)
+        store.goalkeeper_strategy_player_id = goalkeeper.id
+
+    ball_velocity = _estimate_goalkeeper_ball_velocity(context, store)
+    ball_speed = getattr(store, "goalkeeper_ball_speed", None)
+    opponent_nearest_distance = _nearest_opponent_distance(context)
+    threat = _estimate_goalkeeper_threat(
+        context,
+        ball_velocity,
+        opponent_nearest_distance,
+    )
+    home_target = _get_goalkeeper_home_target(context)
+    current_mode = getattr(store, "goalkeeper_mode", None)
+    open_play_mode = getattr(store, "open_play_mode", None)
+    has_explicit_field_protection = open_play_mode in (
+        OpenPlayMode.DEFENDING,
+        OpenPlayMode.CONTESTED,
+    )
+    can_challenge = (
+        allow_active_response
+        and has_explicit_field_protection
+        and not threat.fast_goal_threat
+        and _goalkeeper_can_challenge(
+            context,
+            goalkeeper,
+            opponent_nearest_distance,
+            ball_speed,
+            len(field_players),
+            current_mode,
+        )
+    )
+
+    ball = context.ball
+    goalkeeper_ball_distance = (
+        dist(
+            goalkeeper.pose.x,
+            goalkeeper.pose.y,
+            ball.x,
+            ball.y,
+        )
+        if ball is not None else math.inf
+    )
+    clear_distance_limit = (
+        GOALKEEPER_CLEAR_EXIT_DISTANCE_M
+        if current_mode == GoalkeeperMode.CLEAR
+        else GOALKEEPER_CLEAR_ENTER_DISTANCE_M
+    )
+    ball_clearable = (
+        allow_active_response
+        and ball is not None
+        and not threat.fast_goal_threat
+        and _ball_in_own_danger_area(context)
+        and goalkeeper_ball_distance <= clear_distance_limit
+    )
+    mode = _update_goalkeeper_mode(
+        context,
+        goalkeeper,
+        threat,
+        can_challenge,
+        ball_clearable,
+        home_target,
+        allow_active_response,
+        store,
+    )
+
+    clearance_target = None
+    goalkeeper_subaction = None
+    if mode == GoalkeeperMode.BLOCK:
+        target = _get_goalkeeper_block_target(context, ball_velocity)
+        goalkeeper.guard(
+            target,
+            avoid_ball=False,
+            avoid_robots=True,
+            arrive_dist=GOALKEEPER_TRACK_ARRIVE_M,
+        )
+    elif mode == GoalkeeperMode.CHALLENGE and ball is not None:
+        target = (ball.x, ball.y)
+        goalkeeper.goalkeeper_challenge(target)
+        goalkeeper_subaction = goalkeeper.action.removeprefix(
+            "goalkeeper:challenge:",
+        )
+    elif mode == GoalkeeperMode.CLEAR:
+        clearance_target = _get_safe_goalkeeper_clearance_target(context)
+        target = (ball.x, ball.y) if ball is not None else home_target
+        if clearance_target is None:
+            goalkeeper.guard(home_target)
+            goalkeeper_subaction = "fallback_guard"
+        else:
+            goalkeeper.goalkeeper_clear(
+                clearance_target,
+                GOALKEEPER_CLEAR_POWER,
+            )
+            goalkeeper_subaction = goalkeeper.action.removeprefix(
+                "goalkeeper:clear:",
+            )
+    else:
+        target = home_target
+        goalkeeper.guard(
+            target,
+            avoid_ball=True,
+            avoid_robots=True,
+            arrive_dist=GOALKEEPER_TRACK_ARRIVE_M,
+        )
+
+    store.goalkeeper_target = target
+    store.goalkeeper_clearance_target = clearance_target
+    goalkeeper_kind = (
+        "temporary"
+        if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None)
+        else "default"
+    )
+    goalkeeper.action = f"goalkeeper:{mode.value}:{goalkeeper_kind}"
+    if goalkeeper_subaction is not None:
+        goalkeeper.action = f"{goalkeeper.action}:{goalkeeper_subaction}"
+    _draw_goalkeeper_strategy(
+        context,
+        goalkeeper,
+        mode,
+        target,
+        threat,
+        clearance_target,
+        store,
+    )
 
 
 def _estimate_open_play_mode(
@@ -990,28 +1686,6 @@ def _draw_open_play_mode(context: Context, store) -> None:
     )
 
 
-def _should_single_player_guard(context: Context, player: Player) -> bool:
-    """单人降级时仅在球门危险或机器人仍在门前时坚持守门。"""
-    ball = context.ball
-    if ball is None or player.pose is None:
-        return True
-
-    own_penalty_edge_x = (
-        -context.field.length / 2.0 + context.field.penalty_area_length
-    )
-    if ball.x <= own_penalty_edge_x:
-        return True
-
-    own_goal_x, own_goal_y = own_goal(context)
-    goal_protection_distance = context.field.penalty_area_length + 0.5
-    return dist(
-        player.pose.x,
-        player.pose.y,
-        own_goal_x,
-        own_goal_y,
-    ) <= goal_protection_distance
-
-
 def _get_normal_defense_protect_target(
     context: Context,
 ) -> tuple[float, float] | None:
@@ -1105,17 +1779,6 @@ def _act_normal_defense(
     store,
 ) -> None:
     """按已分配职责执行普通比赛的守门、逼抢和保护。"""
-    if goalkeeper is not None:
-        goalkeeper.guard()
-        goalkeeper_kind = (
-            "temporary"
-            if goalkeeper.id == getattr(
-                store, "temporary_goalkeeper_id", None,
-            )
-            else "default"
-        )
-        goalkeeper.action = f"defense:goalkeeper:{goalkeeper_kind}"
-
     if pressure_player is not None:
         _act_normal_defense_pressure(context, pressure_player)
 
@@ -1133,17 +1796,6 @@ def _act_normal_contested_shape(
     store,
 ) -> None:
     """执行争议球安全结构：一人处理球，另一人保护球门方向中路。"""
-    if goalkeeper is not None:
-        goalkeeper.guard()
-        goalkeeper_kind = (
-            "temporary"
-            if goalkeeper.id == getattr(
-                store, "temporary_goalkeeper_id", None,
-            )
-            else "default"
-        )
-        goalkeeper.action = f"contested:goalkeeper:{goalkeeper_kind}"
-
     if challenge_player is not None:
         _act_normal_defense_pressure(context, challenge_player)
         challenge_subaction = challenge_player.action.removeprefix(
@@ -1214,7 +1866,13 @@ def _act_normal(
             )
         else:
             if role_goalkeeper is not None:
-                _act_goalkeeper_guard(role_goalkeeper, store)
+                _act_goalkeeper_guard(
+                    context,
+                    role_goalkeeper,
+                    assigned_field_players,
+                    store,
+                    allow_active_response=False,
+                )
             for player in assigned_field_players:
                 player.action = "ball_unknown:stop"
                 player.stop()
@@ -1223,7 +1881,13 @@ def _act_normal(
     if not allow_ball_search:
         # OUR_SET_PLAY 暂时复用该入口，但固定战术不进入普通比赛三态。
         if role_goalkeeper is not None:
-            _act_goalkeeper_guard(role_goalkeeper, store)
+            _act_goalkeeper_guard(
+                context,
+                role_goalkeeper,
+                assigned_field_players,
+                store,
+                allow_active_response=False,
+            )
         if primary_attacker is not None:
             _act_normal_primary_attacker(primary_attacker)
         if front_partner is not None:
@@ -1264,35 +1928,24 @@ def _act_normal(
         and role_goalkeeper is not None
         and primary_attacker is None
     ):
-        single_player_must_guard = _should_single_player_guard(
-            context, role_goalkeeper,
+        # 唯一可用者既然承担守门身份，就不再降级为普通 primary attacker。
+        _act_goalkeeper_guard(
+            context,
+            role_goalkeeper,
+            assigned_field_players,
+            store,
+            allow_active_response=True,
         )
-        if (
-            open_play_mode == OpenPlayMode.ATTACKING
-            and not single_player_must_guard
-        ):
-            # 保留 T02 的单人远离己方门时处理球降级，不改变守门员身份状态。
-            _act_normal_attacking_shape(
-                context,
-                None,
-                role_goalkeeper,
-                None,
-                store,
-            )
-        elif (
-            open_play_mode == OpenPlayMode.CONTESTED
-            and not single_player_must_guard
-        ):
-            _act_normal_contested_shape(
-                context,
-                None,
-                role_goalkeeper,
-                None,
-                store,
-            )
-        else:
-            _act_goalkeeper_guard(role_goalkeeper, store)
         return
+
+    if role_goalkeeper is not None:
+        _act_goalkeeper_guard(
+            context,
+            role_goalkeeper,
+            assigned_field_players,
+            store,
+            allow_active_response=True,
+        )
 
     if open_play_mode == OpenPlayMode.ATTACKING:
         _act_normal_attacking_shape(
@@ -1322,13 +1975,22 @@ def _act_normal(
     )
 
 
-def _act_goalkeeper_guard(goalkeeper: Player, store) -> None:
-    """执行现有守门动作,并保留默认或临时守门员身份标签。"""
-    goalkeeper.guard()
-    if goalkeeper.id == getattr(store, "temporary_goalkeeper_id", None):
-        goalkeeper.action = "temp_goalkeeper:guard"
-    else:
-        goalkeeper.action = "goalkeeper:guard"
+def _act_goalkeeper_guard(
+    context: Context,
+    goalkeeper: Player,
+    field_players: list[Player],
+    store,
+    *,
+    allow_active_response: bool,
+) -> None:
+    """统一守门入口；固定重启只允许保守 HOLD/TRACK。"""
+    _act_goalkeeper_strategy(
+        context,
+        goalkeeper,
+        field_players,
+        store,
+        allow_active_response=allow_active_response,
+    )
 
 
 def _update_ball_recovery_state(context: Context, store) -> bool:
@@ -1362,7 +2024,13 @@ def _act_ball_recovery(
 ) -> None:
     """NORMAL 丢球恢复:一人定向扫场,其余保持守位或停止。"""
     if goalkeeper is not None:
-        _act_goalkeeper_guard(goalkeeper, store)
+        _act_goalkeeper_guard(
+            context,
+            goalkeeper,
+            field_players,
+            store,
+            allow_active_response=False,
+        )
     if not field_players:
         return
 
@@ -1419,11 +2087,17 @@ def _act_our_kickoff(
     if not players:
         return
 
-    if goalkeeper is not None:
-        _act_goalkeeper_guard(goalkeeper, store)
     field_players = [
         player for player in players if player is not goalkeeper
     ]
+    if goalkeeper is not None:
+        _act_goalkeeper_guard(
+            context,
+            goalkeeper,
+            field_players,
+            store,
+            allow_active_response=False,
+        )
     if not field_players:
         store.kickoff_taker = None
         return
@@ -1609,7 +2283,13 @@ def _act_our_set_play(
     ]
     if not field_players:
         if goalkeeper is not None:
-            _act_goalkeeper_guard(goalkeeper, store)
+            _act_goalkeeper_guard(
+                context,
+                goalkeeper,
+                field_players,
+                store,
+                allow_active_response=False,
+            )
         return
 
     set_play = get_set_play_type(context)

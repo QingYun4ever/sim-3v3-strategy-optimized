@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/07-19-goalkeeper-advanced-strategy/prd.md", "reason": "Manually review every goalkeeper mode, safety constraint, observability requirement, and excluded fixed tactic against the implementation."}
+{"file": ".trellis/tasks/07-19-goalkeeper-advanced-strategy/design.md", "reason": "Check state priority, velocity validity, challenge conservatism, clearance direction, and phase compatibility against the approved design."}
+{"file": ".trellis/tasks/07-19-availability-degraded-roster/prd.md", "reason": "Confirm default/temporary goalkeeper identity, unavailable-player filtering, and 0-3 player degradation remain intact."}
+{"file": ".trellis/tasks/archive/2026-07/07-19-match-state-restart-safety/prd.md", "reason": "Confirm opponent restart and STOP/SET safety are not routed into advanced goalkeeper actions."}

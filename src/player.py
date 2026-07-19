@@ -835,14 +835,19 @@ class Player:
         direction = 1.0 if sweep_direction >= 0.0 else -1.0
         self.set_velocity(0.0, 0.0, direction * BALL_SEARCH_YAW_SPEED)
 
-    def guard(self) -> None:
-        """守门:站小禁区中央待命
-
-        无 pose(未就位)时退回站小禁区中央。
-        """
+    def guard(
+        self,
+        target: tuple[float, float] | None = None,
+        *,
+        avoid_ball: bool = True,
+        avoid_robots: bool = True,
+        arrive_dist: float = ARRIVE_DIST,
+    ) -> None:
+        """走向指定门前目标；无目标时兼容原有小禁区中央站位。"""
         self._reset_ball_approach()
-        home = own_goal_area_center(self.context) if self.context is not None else None
-        if home is None or self.pose is None:
+        if target is None and self.context is not None:
+            target = own_goal_area_center(self.context)
+        if target is None or self.pose is None:
             self.action = "guard:stop"
             self.stop()
             return
@@ -858,9 +863,76 @@ class Player:
 
         self.action = "guard:home"
         debugdraw.point(
-            home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
+            target[0], target[1],
+            rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        self.walk_to(
+            target,
+            face=face,
+            avoid_ball=avoid_ball,
+            avoid_robots=avoid_robots,
+            arrive_dist=arrive_dist,
+        )
+
+    def goalkeeper_challenge(
+        self,
+        target: tuple[float, float],
+    ) -> None:
+        """守门员直取慢速危险球，不把球当作绕行障碍。"""
+        self._reset_ball_approach()
+        ball = self.context.ball if self.context is not None else None
+        pose = self.pose
+        if ball is None or pose is None:
+            self.action = "goalkeeper:challenge:stop"
+            self.stop()
+            return
+
+        face = angle_to(pose.x, pose.y, ball.x, ball.y)
+        self.action = "goalkeeper:challenge:approach"
+        self.walk_to(
+            target,
+            face=face,
+            avoid_ball=False,
+            avoid_robots=False,
+            arrive_dist=GOALKEEPER_CLEAR_ENTER_DISTANCE_M,
+        )
+
+    def goalkeeper_clear(
+        self,
+        clearance_target: tuple[float, float],
+        power: float,
+    ) -> None:
+        """接近门前球并按指定正向目标解围，不使用普通进攻绕球状态。"""
+        self._reset_ball_approach()
+        context = self.context
+        ball = context.ball if context is not None else None
+        pose = self.pose
+        if context is None or ball is None or pose is None:
+            self.action = "goalkeeper:clear:stop"
+            self.stop()
+            return
+
+        target_x = max(clearance_target[0], ball.x + 0.5)
+        safe_target = (target_x, clearance_target[1])
+        kick_direction = angle_to(ball.x, ball.y, *safe_target)
+        if math.cos(kick_direction) <= 0.0:
+            kick_direction = 0.0
+
+        ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+        if ball_distance <= GOALKEEPER_CLEAR_ENTER_DISTANCE_M:
+            self.kick(kick_direction, power)
+            self.action = "goalkeeper:clear:kick"
+            return
+
+        self.release_kick()
+        self.action = "goalkeeper:clear:approach"
+        self.walk_to(
+            (ball.x, ball.y),
+            face=kick_direction,
+            avoid_ball=False,
+            avoid_robots=False,
+            arrive_dist=GOALKEEPER_CLEAR_ENTER_DISTANCE_M,
+        )
 
     def support(self) -> None:
         """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。

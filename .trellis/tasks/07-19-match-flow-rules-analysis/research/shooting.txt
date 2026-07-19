@@ -1,0 +1,170 @@
+--- PAGE 1 ---\n如何找到最适合的射⻔队员
+Englishversion: Howtofindthemostsuitableshooter
+https://www.bilibili.com/video/BV1JtMx6bEZD/?
+spm_id_from=888.80997.embed_other.whitelist&bvid=BV1JtMx6bEZD&vd_source=9f5e828a151
+2e75548042a94d63f77f3
+找到最适合的射⻔队员是⽐赛策略最重要课题之⼀。⽰例代码策略设置⼀名主动进攻球员，定义为
+Chaser ⻆⾊。职责是追球并完成射⻔。选择最适合的球员成为Chaser ，才能最⼤化进攻效率。
+追球者选择算法的思路
+追球者选择由`DefaultPlaybook.select_chaser()`实现，每帧执⾏⼀次。它是⼀个三层筛选过程：
+代码块
+select_chaser(ctx) 
+  →  第⼀层：资格筛选（谁 " 能 " 去追球？） 
+    →  第⼆层：代价评分（谁追球 " 最划算 " ？） 
+      →  第三层：平局仲裁（同分时选谁？） 
+        →  选中  Chaser 
+Chaser每帧只能是⼀个⼈——只有⼀个球员会执⾏追踢⾏为，其余⼈都是⽀援站位Supporter 。
+第⼀层：ReadySlot资格过滤
+select_chaser的第⼀步是资格筛选，筛选掉完全不适合成为Chaser 的机器⼈。
+筛选和球员默认位置ReadySlot 联系紧密。ReadySlot 决定了球员在⽐赛Ready阶段所站的位
+置，也是球员的兜底策略会回到的位置。
+ReadySlot 这是⼀个枚举类型，定义在 src/soccer_framework/types.py 。共有三个位
+置：KEEPER, SIDE, CENTER 。
+这三个ReadySlot的差异贯穿了追球者选择算法和之后追球者⾏为逻辑：
+-CENTER：球队主攻⼿。追球代价最低（优先追球），踢球时⾛完整决策链（传→射→带）。
+-SIDE：边路辅助。只在条件合适时追球，踢球时⾛"只传不射⻔"策略——不许射⻔。
+-KEEPER：⻔将。正常情况不追球，只有当球进⼊⼰⽅危险区域（禁区范围）时才出击解围。
+在第⼀层中，我们为不同ReadySlot 安排的球员设定了初始判断，⽤
+ball_in_own_defensive_area 和side_should_challenge 两个函数限制了KEEPER和
+1
+2
+3
+4
+5\n\n--- PAGE 2 ---\nSIDE成为Chaser 的可能性。
+代码块
+def _slot_can_challenge( 
+    self, 
+    slot: ReadySlot, 
+    ctx: PlayContext, 
+) -> bool: 
+    targeting = self.kit.targeting 
+    ball = ctx.known_ball 
+    if slot == ReadySlot.KEEPER: 
+        return targeting.ball_in_own_defensive_area(ball) 
+    if slot == ReadySlot.SIDE: 
+        return targeting.side_should_challenge(ctx) 
+    return True 
+在第⼀层筛选中，ReadySlot.KEEPER 只有球进⼊⼰⽅禁区危险区时才可以被分配Chaser ，
+ReadySlot.SIDE 只有在side_should_challenge 返回True的情况下才可以被分配
+Chaser 。
+第⼆层计算抢球评分
+对第⼀层筛选后，有资格成为Chaser 的球员，分别调⽤ball_claim_score 计算抢球评分，分
+越低，越适合成为Chaser 。
+评分=距离+槽位偏置。分值越低越好。
+ReadySlot 条件 公式 偏置
+CENTER ⽆ distance - 0.20 -0.20（最优先）
+SIDE ⽆ distance - 0.10 -0.10（次优先）
+KEEPER 球在危险区 distance - 0.75 -0.75（最⾼优先）
+KEEPER 球不在危险区 distance + 14.0 +14.0（最低优先）
+举两个例⼦：
+1. 假设球在(2.0,0.0)，三个球员的位置分别为：
+球员 ReadySlot 位置 到球距离 评分
+球员1 CENTER (1.0,0.3) 1.04 1.04-0.20=0.84
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12\n\n--- PAGE 3 ---\n球员2 SIDE (-0.5,2.0) 3.20 3.20-0.10=3.10
+球员3 KEEPER (-6.0,0.0) 8.00 8.00+14.0=22.00
+因球员1评分最低，分配CHASER 给球员1。
+2. 如果球进⼊禁区(-5.0,0.0)：
+球员 位置 到球距离 评分
+球员1 (0.0,0.5) 5.02 5.02-0.20=4.82
+球员2 (0.0,-2.0) 5.39 5.39-0.10=5.29
+球员3 (-5.5,0.0) 0.50 0.50-0.75=-0.25
+因球员3评分最低，分配CHASER 给球员3。
+第三层平局仲裁
+在第⼆层计算后，如果出现选择评分最低且差距较⼤，选择得分最低的机器⼈成为Chaser ；如果最
+低得分差距<0.15m时，取player_id最⼩的。
+这⾥设置平局仲裁的原因是，当两个球员评分⾮常接近，意味着他们和球的距离⼏乎⼀样。球的轻微
+移动很容易改变两个球员的⼤⼩关系。此时选player_id最⼩的作为追球者，避免两帧之间频繁切换追
+球者导致⾏为不稳定。\n\n--- PAGE 4 ---\n追球者选择算法演⽰-可拖动球员和球.html
+三层筛选的具体流程可参考下⽅流程图：
+\n\n--- PAGE 5 ---\nChaser的决策链
+当Chaser接近球并进⼊踢球范围后，ChaserRole的⾏为树会按以下优先级逐级尝试：
+1. 边线脱困（sideline_recovery ）：球贴边线不好踢→带离边线重新触球
+2. 直接射⻔（kick_at_goal ）：检查射⻔通道是否畅通（shot_lane_is_clear ）→可⾏
+则射⻔
+3. 传给队友（pass_to_teammate ）：找到最佳传球⽬标（best_pass_target ），要求传
+球路径畅通且向前推进
+4. 带球前推（dribble ）：以上都不⾏→向对⽅球⻔⽅向带球推进（dribble_target ）
+Chaser移动到球的过程由 MotionController.move_to_target完成（详⻅ 在3v3⽰例代
+码中优化机器⼈移动⾏为）。进⼊踢球范围后，Chaser还需根据迟滞模型（kick_hysteresis ）
+判断是否真正进⼊/退出踢球态，避免在边界附近反复进出导致⾏为抖动。踢球进⼊距离为
+soccer_kick_enter_distance （默认2.5m），退出距离为
+soccer_kick_exit_distance （默认3.0m），并附加1.5秒的退出延迟。\n\n--- PAGE 6 ---\n出球决策的核⼼⼊⼝函数是select_kick_target 。它逐⼀评估四种候选⽬标，为每种⽬标计算
+⼀个综合评分，最终选择评分最⾼的⽅案：
+候选⽬标 评分函数 要求
+直接射⻔ shot_score （通⾏度×⻆度偏
+置）
+pass_enabled=True ，射⻔路径畅通
+传球给最佳队友 pass_score pass_enabled=True ，路径畅通，向前推进≥
+pass_min_forward_m
+带球推进 dribble_score ⽬标在对⽅半场，⾮KEEPER⻆⾊
+解围/⼤脚开出 低分兜底 以上均不可⾏时的最后⼿段
+每种⽬标的评分⼀旦低于 pass_min_score （默认0.52）就会被淘汰。此外，⻆⾊类型也影响候
+选范围——SIDE⻆⾊的球员不允许射⻔（只传不射），CENTER⻆⾊⾛完整决策链。
+调整测试
+我们可以通过测试⼀个极端的select_chaser 策略来观察和默认策略的效果差异。
+使⽤以下函数代替⽰例select_chaser ，将会始终选择站位第⼆靠后的球员成为CHASER 。
+代码块
+def select_chaser(self, context: PlayContext) -> int: 
+ 
+        config = self.kit.config 
+ 
+        scored: list[tuple[float, int]] = [] 
+        for player_id in config.player_ids: 
+            robot = context.teammates.get(player_id) 
+            if robot is None or robot.pose is None: 
+                continue 
+            scored.append((robot.pose.x, player_id)) 
+ 
+        if not scored: 
+            return min(config.player_ids) 
+ 
+        scored.sort() 
+        return scored[1][1] 
+经过观察，我们发现⼀旦chaser带球跑到球队最前位置就会站住。同时，中间位置的球员会⽴刻被分
+配chaser。这个策略的问题可以怎样调整呢？你可以尝试优化这种策略。
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16\n\n--- PAGE 7 ---\n参考调整思路：1.分配中间位置的球员为Chaser后，分配最前位置的球员冲向对⽅球⻔接应；2.位
+置判断前，先⽤距离判断⼀次，只有在所有球员都不在球附近时执⾏这个策略，如果有球员在球附
+近，则该球员成为chaser。
+附录：相关配置参数速查
+所有参数定义在 SoccerStrategyTuning （src/soccer_framework/config.py ）：
+参数 默认值 说明
+teammate_challenge_tie_margin_m 0.15 Chaser平局判定带（⽶）
+pass_enabled True 传球总开关
+pass_min_score 0.52 传球候选最低评分
+pass_min_forward_m 0.35 传球必须向前推进的最⼩距离（⽶）
+pass_lane_clearance 0.75 传球路径所需净空宽度（⽶）
+dribble_advance_m 1.15 单次带球前推距离（⽶）
+dribble_center_pull 0.65 带球向中路靠拢的⽐例
+sideline_recovery_margin_m 0.90 离边线多近触发脱困（⽶）
+sideline_recovery_infield_m 1.60 脱困往场内拉回距离（⽶）
+sideline_recovery_advance_m 0.75 脱困同时前推距离（⽶）
+goalkeeper_challenge_margin_m 0.70 ⻔将出击触发余量（⽶）
+soccer_kick_enter_distance 2.5 进⼊踢球态的距离阈值（⽶）
+soccer_kick_exit_distance 3.0 退出踢球态的距离阈值（⽶）
+soccer_kick_exit_delay_sec 1.5 退出踢球态的延迟（秒）

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "The implementation changes an existing restart-clearance constant and adds geometry helpers; search and reuse guidance prevents duplicate parameters and overlapping helpers."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Trace the referee-state contract through phase classification and player commands without changing framework protocol types."}

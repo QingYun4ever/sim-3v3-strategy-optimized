@@ -23,7 +23,14 @@ from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
 from .player import Player
-from .utils import dist, opponent_goal, own_goal
+from .utils import (
+    angle_to,
+    clamp,
+    dist,
+    opponent_goal,
+    own_goal,
+    own_goal_area_center,
+)
 
 
 _log = logging.getLogger(__name__)
@@ -51,6 +58,10 @@ def get_phase(context: Context) -> Phase:
     if g is None:
         return Phase.STOPPED
 
+    # 裁判明确停止时优先停车,包括 READY + stopped 等组合状态。
+    if g.stopped:
+        return Phase.STOPPED
+
     state = g.state
 
     # READY:走 ready 位
@@ -58,7 +69,7 @@ def get_phase(context: Context) -> Phase:
         return Phase.READY
 
     # PLAYING:正常拼抢 or 开球/定位球执行中
-    if state == GameState.PLAYING and not g.stopped:
+    if state == GameState.PLAYING:
         # 定位球:set_play != NONE,kicking_team 指示哪方
         if g.set_play != SetPlay.NONE and g.kicking_team != KICKING_TEAM_NONE:
             our_team = context.team_id
@@ -78,7 +89,7 @@ def get_phase(context: Context) -> Phase:
         # 正常拼抢
         return Phase.NORMAL
 
-    # SET / INITIAL / FINISHED / stopped:站定
+    # SET / INITIAL / FINISHED:站定
     return Phase.STOPPED
 
 def get_set_play_type(context: Context) -> SetPlay:
@@ -391,20 +402,151 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         p.stop()
 
 
+def _clamp_restart_target(
+    context: Context,
+    target: tuple[float, float],
+) -> tuple[float, float]:
+    """把重启等待点限制在场内,避免规则避让点落到边线之外。"""
+    field_margin = 0.3
+    half_length = max(0.0, context.field.length / 2.0 - field_margin)
+    half_width = max(0.0, context.field.width / 2.0 - field_margin)
+    return (
+        clamp(target[0], -half_length, half_length),
+        clamp(target[1], -half_width, half_width),
+    )
+
+
+def _project_target_outside_radius(
+    target: tuple[float, float],
+    center: tuple[float, float],
+    minimum_distance: float,
+    fallback_direction: tuple[float, float],
+) -> tuple[float, float]:
+    """目标落入禁入圆时,沿当前方向投影到圆外。"""
+    offset_x = target[0] - center[0]
+    offset_y = target[1] - center[1]
+    current_distance = math.hypot(offset_x, offset_y)
+    if current_distance >= minimum_distance:
+        return target
+
+    if current_distance > 1e-6:
+        direction_x = offset_x / current_distance
+        direction_y = offset_y / current_distance
+    else:
+        fallback_length = math.hypot(*fallback_direction)
+        if fallback_length <= 1e-6:
+            direction_x, direction_y = -1.0, 0.0
+        else:
+            direction_x = fallback_direction[0] / fallback_length
+            direction_y = fallback_direction[1] / fallback_length
+
+    return (
+        center[0] + direction_x * minimum_distance,
+        center[1] + direction_y * minimum_distance,
+    )
+
+
+def _prepare_restart_target(
+    context: Context,
+    preferred_target: tuple[float, float],
+    *,
+    stay_outside_center_circle: bool = False,
+) -> tuple[float, float]:
+    """生成场内、避球且可选中圈外的对方重启等待点。"""
+    target = _clamp_restart_target(context, preferred_target)
+    own_goal_x, own_goal_y = own_goal(context)
+
+    # 反复投影可处理球不完全位于中点时两个禁入圆部分重叠的情况。
+    for _projection_pass in range(4):
+        if stay_outside_center_circle:
+            target = _project_target_outside_radius(
+                target,
+                (0.0, 0.0),
+                context.field.circle_radius + CIRCLE_MARGIN_M,
+                (-1.0, 0.0),
+            )
+            target = _clamp_restart_target(context, target)
+
+        ball = context.ball
+        if ball is not None:
+            target = _project_target_outside_radius(
+                target,
+                (ball.x, ball.y),
+                OPPONENT_RESTART_AVOID_M,
+                (own_goal_x - ball.x, own_goal_y - ball.y),
+            )
+            target = _clamp_restart_target(context, target)
+
+    return target
+
+
+def _walk_to_restart_target(
+    context: Context,
+    player: Player,
+    target: tuple[float, float],
+    action: str,
+    *,
+    stay_outside_center_circle: bool = False,
+) -> None:
+    """对方重启期间只执行避球、避机器人的安全走位。"""
+    safe_target = _prepare_restart_target(
+        context,
+        target,
+        stay_outside_center_circle=stay_outside_center_circle,
+    )
+    face = 0.0
+    ball = context.ball
+    if ball is not None:
+        face = angle_to(player.pose.x, player.pose.y, ball.x, ball.y)
+
+    player.action = action
+    player.walk_to(
+        safe_target,
+        face=face,
+        avoid_ball=True,
+        avoid_robots=True,
+    )
+
+
 def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
-    """对方开球:一人守门,其余人站到中圈外固定点等待。"""
+    """对方中场开球:守门并在中圈、球的合法距离外等待。"""
     if not players:
         return
-    gx, gy = own_goal(context)
-    guard = min(players, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-    guard.guard()
 
-    rest = [p for p in players if p is not guard]
-    r = context.field.circle_radius
-    slots = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
-    for p, target in zip(rest, slots):
-        p.action = "opp_kickoff:ready"
-        p.walk_to(target, avoid_ball=True, avoid_robots=True)
+    own_goal_x, own_goal_y = own_goal(context)
+    guard = min(
+        players,
+        key=lambda player: dist(
+            player.pose.x,
+            player.pose.y,
+            own_goal_x,
+            own_goal_y,
+        ),
+    )
+    _walk_to_restart_target(
+        context,
+        guard,
+        own_goal_area_center(context),
+        "opp_kickoff:guard",
+        stay_outside_center_circle=True,
+    )
+
+    waiting_players = [player for player in players if player is not guard]
+    center_clearance = context.field.circle_radius + CIRCLE_MARGIN_M
+    waiting_slots = [
+        (-center_clearance - 0.4, 0.0),
+        (-center_clearance - 1.2, 1.0),
+        (-center_clearance - 1.2, -1.0),
+    ]
+    for slot_index, player in enumerate(waiting_players):
+        target = waiting_slots[slot_index % len(waiting_slots)]
+        _walk_to_restart_target(
+            context,
+            player,
+            target,
+            "opp_kickoff:avoid",
+            stay_outside_center_circle=True,
+        )
 
 
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
@@ -422,9 +564,96 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
     _act_normal(context, players, store, allow_ball_search=False)
 
 
-def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
-    """对方开球： TODO: 实现自己的逻辑。默认与 Normal 相同"""
-    _act_normal(context, players, store, allow_ball_search=False)
+def _act_opp_set_play(context: Context, players: list[Player], _store) -> None:
+    """对方定位球:守门、封堵和保护均在球的合法距离外执行。"""
+    if not players:
+        return
+
+    own_goal_x, own_goal_y = own_goal(context)
+    guard = min(
+        players,
+        key=lambda player: dist(
+            player.pose.x,
+            player.pose.y,
+            own_goal_x,
+            own_goal_y,
+        ),
+    )
+    _walk_to_restart_target(
+        context,
+        guard,
+        own_goal_area_center(context),
+        "opp_restart:guard",
+    )
+
+    field_players = [player for player in players if player is not guard]
+    ball = context.ball
+    if ball is None:
+        for player in field_players:
+            player.action = "opp_restart:stop_no_ball"
+            player.stop()
+        return
+
+    route_to_goal_x = own_goal_x - ball.x
+    route_to_goal_y = own_goal_y - ball.y
+    route_length = math.hypot(route_to_goal_x, route_to_goal_y)
+    if route_length <= 1e-6:
+        route_direction_x, route_direction_y = -1.0, 0.0
+    else:
+        route_direction_x = route_to_goal_x / route_length
+        route_direction_y = route_to_goal_y / route_length
+
+    block_target = _prepare_restart_target(
+        context,
+        (
+            ball.x + route_direction_x * OPPONENT_RESTART_AVOID_M,
+            ball.y + route_direction_y * OPPONENT_RESTART_AVOID_M,
+        ),
+    )
+    blocker = min(
+        field_players,
+        key=lambda player: dist(
+            player.pose.x,
+            player.pose.y,
+            block_target[0],
+            block_target[1],
+        ),
+        default=None,
+    )
+    if blocker is not None:
+        _walk_to_restart_target(
+            context,
+            blocker,
+            block_target,
+            "opp_restart:block",
+        )
+
+    protecting_players = [
+        player for player in field_players if player is not blocker
+    ]
+    protect_distance = min(
+        max(OPPONENT_RESTART_AVOID_M + 0.8, 2.3),
+        route_length,
+    )
+    central_protect_x = ball.x + route_direction_x * protect_distance
+    central_protect_y = (
+        ball.y + route_direction_y * protect_distance
+    ) * 0.35
+
+    for protect_index, player in enumerate(protecting_players):
+        if protect_index == 0:
+            lateral_offset = 0.0
+        else:
+            offset_rank = (protect_index + 1) // 2
+            offset_direction = 1.0 if protect_index % 2 == 1 else -1.0
+            lateral_offset = offset_direction * offset_rank * 0.8
+
+        _walk_to_restart_target(
+            context,
+            player,
+            (central_protect_x, central_protect_y + lateral_offset),
+            "opp_restart:protect",
+        )
 
 
 def _act_ready(context: Context, players: list[Player]) -> None:

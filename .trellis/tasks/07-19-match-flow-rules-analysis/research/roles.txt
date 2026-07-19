@@ -1,0 +1,262 @@
+--- PAGE 1 ---\n如何为场上选⼿分配⻆⾊
+Englishversion: Howtoassignrolestoplayersonthefield
+https://www.bilibili.com/video/BV1EbMx6ZE6B/
+为什么要分配⻆⾊
+在机器⼈⾜球⽐赛中，场上状态（球的位置、球员状态、⽐分等）瞬息万变。⻆⾊分配要解决的问题
+是：在当前赛场动态下，教练怎样安排球员在场上⾏动的思考⽅式？⻆⾊即对应了球员⼀种特定的思
+考⽅式。
+基于球在场地上的位置分配⻆⾊是⼀种简单直观地分配⽅案，⽐如下⾯的分配策略：
+球的位置 位置最靠后的球员 位置第⼆靠后的球员 位置第三靠后的球员
+场地前1/3 守⻔员 进攻⻆⾊ 进攻⻆⾊
+场地中间1/3 守⻔员 防守⻆⾊ 进攻⻆⾊
+场地后1/3 守⻔员 防守⻆⾊ 防守⻆⾊\n\n--- PAGE 2 ---\n根据球位置分配⻆⾊⽰意图-可拖动查看效果.html
+使⽤这种⻆⾊分配策略，当球和对⽅球⻔距离较近时，会分配更多的进攻⻆⾊，攻势更猛。
+也可以基于球员和球的距离设计⻆⾊分配策略，⽐如：
+距离球最近的球员 距离球第⼆近的球员 距离球第三近的球员
+进攻⻆⾊ 防守⻆⾊ 守⻔员
+分配⻆⾊的本质是安排球员做更正确的事。
+由于仿真赛中机器⼈配置相同，且不受电池、电机的运⾏状况影响，位姿（位置和朝向）是机器⼈间
+最主要的区别，也是分配⻆⾊时考虑的⾸要因素。评价位姿要充分考虑赛场环境：即使⼀个球员和球
+的距离最近且朝向球，但如果有对⼿在该球员和球之间，它也可能并不适合作为唯⼀的追球球员。
+好的⻆⾊分配策略会充分利⽤场上的所有信息，包括⽐分信息。如果⽐赛快要结束，你还落后，请分
+配进攻⻆⾊给所有球员，放⼿⼀搏吧！
+⾏为树中的⻆⾊分配节点
+在⽰例策略的⾏为树框架中，每帧的 PLAYING 阶段， AssignRoles 节点都会重新分配⻆⾊。其
+底层架构与数据流向如下：
+代码块\n\n--- PAGE 3 ---\n计算分配⽅案的过程： 
+AssignRoles.update() ( ⾏为树节点 ) 
+    ├──  1. 从  RosTruthProvider 读取世界状态  →  构造  PlayContext 
+    ├──  2. 调⽤  playbook.assign_roles(PlayContext) →  返回  RoleAssignment 
+    └──  3. 将  RoleAssignment 写⼊⿊板  /team/roles 
+            │ 
+            ▼ 
+使⽤分配⽅案的过程： 
+每个  Player ⾏为⼦树顶层的  Selector 节点  依据⿊板上记录的分配信息判断⻆⾊ 
+    ├──  IsRole(1, "chaser") ─── > 匹配  ─── > ChaserRole.build_subtree() 
+    ├──  IsRole(1, "supporter") ─ > 匹配  ─── > SupporterRole.build_subtree() 
+    ├──  IsRole(1, "goalkeeper") > 匹配  ─── > GoalkeeperRole.build_subtree() 
+    └──  若均未匹配  ─────────────────────── > 触发  WaitForBall 兜底策略 
+Playbook.assign_roles ⽅法实现了⻆⾊分配策略。⽅法参数PlayContext 记录了⽐赛当下
+的各种信息。依据PlayContext 计算出⻆⾊分配⽅案RoleAssignment 会记录在⿊板中。接下
+来，每个机器⼈在IsRole 节点使⽤RoleAssignment 确认⾃⾝⻆⾊，并进⼊⻆⾊对应的⼦⾏为
+树。
+Playbook类介绍
+实例化
+Runtime初始化时，为⾏为树框架TeamStrategyTree 创建 Playbook 实例。随后每次⾏为树
+tick ，树的特定节点使⽤此Playbook 实例分配⻆⾊。
+数据来源
+PlayContext 来⾃对⽐赛裁判机等数据来源的持续追踪，对这些数据的理解和使⽤深度，决定了
+Playbook 分配⻆⾊的效果。
+PlayContext 中的信息明细⻅表格：
+信息类
+别
+属性/字段 类型 说明 数据⽰例
+游戏状
+态
+context.game
+
+GameControl
+State|None
+当前游戏控制状态（可
+能为None）
+GameControlState
+ context.game.state
+
+GameState 游戏阶段：INITIAL,
+READY,SET,PLAYING,
+FINISHED
+GameState.PLAYING
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13\n\n--- PAGE 4 ---\n context.game.game_
+phase
+GamePhase 正常/点球/加时/超时 GamePhase.NORMAL
+ context.game.set_pla
+y
+SetPlay 定位球类型：禁区球、
+任意球、点球、界外球
+等
+SetPlay.NONE/
+SetPlay.CORNER_KICK
+ context.game.stoppe
+d
+bool 是否停⽌ FALSE
+ context.game.kicking
+_team
+int 当前开球队伍ID 1/2/255
+ context.game.first_h
+alf
+bool 是否上半场 TRUE
+ context.game.secs_re
+maining
+int 剩余时间（秒） 300
+球的状
+态
+context.ball BallState|
+None
+当前球的位置和信息
+（可能为None）
+BallState/None
+ context.ball.x,.y float 球的绝对坐标位置 x=0.5,y=-1.2
+ context.ball.last_see
+n_at
+float 上次看到球的时间戳 1234567.89
+ context.ball.confiden
+ce
+float 置信度 1.0/0.85
+ context.known_ball BallState 已确认有效的球状态
+（⽆法为None）
+BallState
+队友信
+息
+context.teammates dict[int,
+RobotState]
+所有队友的状态字典
+（key=player_id）
+{1:RobotState,2:RobotState}
+ teammates[id].pose Pose2D|
+None
+队友的位置和朝向
+ x,y,theta
+Pose2D(x=3.0,y=2.5,
+theta=0.785)/None
+ teammates[id].last_s
+een_at
+float 上次看到队友的时间戳 1234567.85
+ teammates[id].is_rec
+ent
+bool 队友信息是否最近更新
+过
+TRUE
+对⽅信
+息
+context.opponents dict[int,
+RobotState]
+所有对⼿的状态字典
+（key=player_id）
+{1:RobotState(...),2:
+RobotState(...)}
+ opponents[id].pose 对⼿的位置和朝向\n\n--- PAGE 5 ---\nPose2D|
+None
+Pose2D(x=-2.0,y=1.5,
+theta=3.14)/None
+ opponents[id].last_s
+een_at
+float 上次看到对⼿的时间戳 1234567.82
+ opponents[id].is_rec
+ent
+bool 对⼿信息是否最近更新
+过
+FALSE
+队伍信
+息
+context.game.teams[
+0/1]
+TeamState 我⽅/对⽅队伍信息 TeamState(team_number=1,
+score=2,...)
+ .score int ⽐分 2
+ .players[id-1] PlayerState 具体球员的处罚状态等 PlayerState(penalty=Penalty.
+NONE,
+secs_till_unpenalised=0)
+ .players[id-1].penalty Penalty 球员处罚类型 Penalty.NONE/
+Penalty.PUSHING
+ .players[id-
+1].secs_till_unpenalis
+ed
+int 处罚剩余时间 0/30
+理解Role
+Playbook 是教练视⻆，职责是输出⼀个映射表（如 {Player_1: "chaser", Player_2: 
+"defender"} ）；Role 是球员视⻆，是具体⻆⾊的抽象定义。每个 Role 都对应⼀棵专职的⾏
+为⼦树（Sub-tree ）。当球员被分配 Role 时，它就会跑这棵⼦树⾥的具体叶⼦节点⾏为（如找
+位、插上、拦截）。
+⽰例策略中预设的⻆⾊有三个：
+⻆⾊ 职责 场上⾏为 ⼦树结构
+chaser 追球、控球、射⻔ 始终朝向球移动，进⼊踢
+球范围后射⻔
+Selector→KickBranch|MoveToTarget
+supporter ⽀援、接应、传球 站在球的侧后⽅，准备接
+应
+MoveToTarget
+goalkeeper 防守球⻔、禁区解围 站在⻔前，球进禁区时出
+击
+Selector→KickBranch|MoveToTarget
+none 静⽌（扩展） 兜底 WaitForBall\n\n--- PAGE 6 ---\n预设分配逻辑
+⽰例代码提供了⼀个默认⻆⾊分配策略 DefaultPlaybook 。其中⻆⾊分配函数代码如下：
+代码块
+def assign_roles(self, ctx: PlayContext) -> RoleAssignment: 
+ 
+    chaser_id = self.select_chaser(ctx) 
+    goalkeeper_id = self._configured_goalkeeper() 
+ 
+    mapping: dict[int, str] = {} 
+    for player_id in self.kit.config.player_ids: 
+        if player_id == goalkeeper_id: 
+            mapping[player_id] = ROLE_GOALKEEPER 
+        elif player_id == chaser_id: 
+            mapping[player_id] = ROLE_CHASER 
+        else: 
+            mapping[player_id] = ROLE_SUPPORTER 
+ 
+    return RoleAssignment(mapping) 
+DefaultPlaybook 分配⻆⾊的逻辑是
+1. 调⽤select_chaser ⽅法找到最适合成为chaser ⻆⾊的球员id，在配置⽂件中找到默认的守
+⻔员id。
+2. 给队伍中最适合的球员分配⻆⾊GAOLKEEPER和CHASER 
+3. 给队伍中其他⼈分配SUPPOTER 
+推荐的⻆⾊分配的逻辑图如下：
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15\n\n--- PAGE 7 ---\n如果你需要调整⻆⾊分配逻辑，可以重写 assign_roles ⽅法。重写请关注：
+1. 动态少⼈：场上可能因为规则惩罚导致少⼈。在分配⻆⾊时，切忌写死球员ID（例如固定1号当守
+⻔员）。
+2. 优先级保全：优先分配重要的⻆⾊。参考⽰例策略中的分配⽅式：优先保全 goalkeeper 和
+chaser ，⼈少时可以不分配supporter 。
+3. 不完全分配：RoleAssignment 具有兜底逻辑，当出现未分配⻆⾊的球员时球员会原地待命
+（对应Playbook.waiting_command ）。\n\n--- PAGE 8 ---\n代码⽰例：根据球在场上的位置调整⻆⾊
+策略思路：基于球在场地上的位置分配⻆⾊，球在前半场全员进攻，球在后半场全员守⻔员。
+代码块
+def assign_roles(self, ctx: PlayContext) -> RoleAssignment: 
+    ball = ctx.ball 
+    player_ids = self.kit.config.player_ids 
+    all_attack = ball.x > 0 
+    mapping = {pid: ROLE_CHASER if all_attack else ROLE_GOALKEEPER for pid in 
+player_ids} 
+    return RoleAssignment(mapping) 
+这段代码中，使⽤PlayContext.ball.x 获取球的纵向坐标。x>0意味着球在对⽅半场，分配进攻
+⻆⾊ROLE_CHASER 给全部球员，否则分配ROLE_GOALKEEPER 给全部球员。你可以尝试此策略和
+预设策略的对⽐效果（/src/play/playbook.py )。
+总结
+在设计与优化策略分配时，请牢记以下要点：
+1. Playbook.assign_roles全权负责宏观⻆⾊的动态分配。
+2. RoleAssignment是Playbook.assign_roles的计算结果。结果写⼊⾏为树⿊板，供⾏为树节点读
+取。
+3. 策略每帧重新计算，⻆⾊可能在毫秒级重新分配。
+4. 考虑少⼈、受罚等场上最极端边界情况，确保系统具备兜底能⼒。
+1
+2
+3
+4
+5
+6

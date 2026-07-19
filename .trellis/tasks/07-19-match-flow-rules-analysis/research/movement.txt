@@ -1,0 +1,210 @@
+--- PAGE 1 ---\n如何优化机器⼈移动⾏为
+Englishversion: HowtoOptimizeRobotMovementBehavior
+https://www.bilibili.com/video/BV1JtMx6bEwu
+移动⾏为策略
+当前的移动⾏为逻辑建⽴在反应式控制的基础上，每帧根据当前环境即时反应，充分适配本次⽐赛场
+地⼩、障碍少、实时性⾼的场景。针对双⾜机器⼈的步态特点，移动速度由正⽅向速度vx 和⻆度
+vyaw 控制，不调整⽔平⽅向速度vy 。
+确定移动⽬标后，策略从以下三个层⾯规划具体的移动⾏为：
+代码块
+战术⽬标点（场系坐标） 
+    │ 
+    ▼ 
+第⼀层：路径绕⾏（ _avoidance_target ） 
+    沿直线检测障碍物，有障碍  →  算绕⾏  via 点 
+    修改⽬标点，不修改控制指令 
+    │ 
+    ▼ 
+第⼆层：⾏⾛控制（ _compute_velocity ） 
+    Unicycle 模型：⽬标点  →  vx + vyaw 
+    三种模式：停⽌  / 纯转向  / 前进 + 跟随转向 
+    │ 
+    ▼ 
+第三层：转向避让（ _apply_yaw_avoidance ） 
+    检测近邻，叠加  vyaw 偏置 " 偏开 " 
+    不修改⽬标点，不修改  vx 
+    │ 
+    ▼ 
+MoveIntent(vx, vy=0, vyaw) 
+三层策略各有侧重，第⼀层考虑障碍物，计算绕⾏点，设定新的移动⽬标；第⼆层计算⾛多快和怎么
+转；第三层考虑障碍物影响，为影响较⼤的障碍物额外增加⻆速度。三层计算的结果综合到⼀起，⽣
+成移动意图MoveIntent 。MoveIntent 最终交由执⾏层下发机器⼈具体移动命令。
+移动策略在tactics/motion.py 中MotionController.move_to_target 中实现。接下
+来，我们结合代码逐层理解移动⾏为策略。
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19\n\n--- PAGE 2 ---\n第⼀层路径绕⾏解析
+路径绕⾏是三层架构的第⼀层，负责解决障碍挡路的问题。
+绕⾏的计算逻辑是：从当前位置画⼀条直线到⽬标，如果中途有障碍物落在路径⾛廊⾥，就在障碍侧
+⾯⽣成⼀个绕⾏via点，把它当作新⽬标。这样底层⾏⾛控制⾃然会绕过去——不需要改速度算法。
+实际场景中，障碍物指同在场上的其他球员或球⻔。障碍物可以离我很远，但只要它挡在路径中段就
+应当考虑；障碍物也可以离我很近，但若不在路径⾛廊⾥就不考虑。
+⾸先，我们需要找到最近的障碍物，此逻辑在_first_blocking_obstacle 中实现。这个函数能
+够根据移动到⽬标的起点和终点信息，结合PlayContext ，计算出需要最先考虑的障碍物。
+如果没有需要考虑的障碍物，_first_blocking_obstacle 将返回None 。即不增加绕⾏点，
+保持原⽬标点。
+如果有障碍物，则需要使⽤_choose_avoid_side 判断绕⾏⽅向：障碍物在路径左侧，向右绕
+⾏，障碍物在路径右侧，向左绕⾏。使⽤_via_pose 计算出绕⾏点。\n\n--- PAGE 3 ---\n注意：_via_pose⽅法返回Pose2D类型的位姿信息，⽽不仅是绕⾏坐标。位姿中的⽅向指向原⽬标
+点，这样，我们可以在接下来两层的速度计算中，即让机器⼈移动到指定坐标，⼜⾯向最终⽬标点。
+最终，如果⽣成的绕⾏点在场地外，调整到场地内部。
+总结⼀下第⼀层避障的逻辑：
+计算逻辑⽰意
+_avoidance_target(player_id, start, target, context) 
+    │ 
+    ├──  _first_blocking_obstacle(start →  target) 
+    │      沿路径投影，找第⼀个挡路的障碍 
+    │      along 落在路径中段  且  lateral < 障碍半径 +safety_margin 
+    │      返回  along 最⼩（离起点最近）的那个 
+    │ 
+    ├──  若⽆障碍  →  清除  avoid_side_by_player 记忆，返回原  target 
+    │ 
+    ├──  若有障碍： 
+    │      ├──  _choose_avoid_side(start, target, obstacle) [ 仅⾸次 ] 
+    │      │      障碍在路径左侧  →  从右绕 (-1) ；障碍在右侧  →  从左绕 (+1) 
+    │      │      结果存⼊  _avoid_side_by_player[player_id] ，跨帧记忆 
+    │      │ 
+    │      └──  _via_pose(start, target, obstacle, side_sign) 
+    │            1. 投影障碍到路径上的最近接触点  closest 
+    │            2. 沿左侧法线偏移  obstacle.radius + safety_margin 
+    │            3. via 朝向指向原  target 
+    │ 
+    └──  TeamFieldFrame.clamp_inside_field(via) →  裁回场内，返回 
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20\n\n--- PAGE 4 ---\n最经过第⼀层的计算，我们确定了更合理的移动⽬标。
+第⼆层⾏⾛控制解析
+⾏⾛控制主要负责计算出球员运动的线速度vx 和⻆速度vyaw ，在tactics/motion.py 中的
+MotionController._compute_velocity 实现。
+第⼆层的⾏⾛控制逻辑如图所⽰：对于A，到达⽬标点判定范围且和停⽌⽬标⽅向基本⼀致，可以停
+⽌；对于B，到达⽬标点判定范围，但朝向不合要求，在原地转向；对于C，未到达⽬标点，且没有朝
+向⽬标点，先纯转向，直到⾯向⽬标点；对于D，未到达⽬标点，但朝向⽬标点，前进到⽬标点。
+需要注意的是，球员会持续关注⾃⼰的位姿状态。随着球员旋转和前进，⼀个处于C状态的球员通常会
+依次经过D、B、A三个状态，最终完成移动。
+在D成为B的运动过程中，MotionController 额外提供了两个有⽤的⽅法，
+_linear_speed ，_angular_velocity 分别计算线速度和⻆速度。两个⽅法均设计了动态微
+调机制，和⽬标越远，速度/⻆速度越⼤。
+我们可以把控制逻辑整理成下⾯的表述：
+1. 如果已经到达⽬标点且朝向正确⽅向，停⽌。
+2. 如果到达⽬标点但朝向不正确，纯转向。
+3. 如果未到达⽬标点且⽅向误差⼤，先转向\n\n--- PAGE 5 ---\n4. 如果未到达⽬标点，边前进边转向。
+经过第⼆层的计算，我们得到了新的指令，包含新⽬标、线速度、⻆速度信息。
+第三层转向避让解析
+这⼀层解决障碍物较近，需要避让的问题。解决⽅式是在第⼆层计算出的⻆速度vyaw上增加额外偏
+置。
+⽐如，当前命令是前进（vx>0），⾝边有队友或对⼿太近。由于双⾜底盘不能横移避开，于是让机器
+⼈多转⼀点，沿"绕开近邻的新⽅向"前进。
+转向避让由_apply_yaw_avoidance 实现，可以看做通过进⼀步分析PlayContext 后，对第
+⼆层计算结果的修正。
+三层计算在move_to_target 中串联，⽣成最终的命令。
+策略效果演⽰
+你可以尝试⽤下⾯不涉及避障的建议控制算法代替move_to_target 。你将看到机器⼈将⽆视障
+碍，以⾮常“耿直”的⽅式移动。
+代码块
+def move_to_target( 
+        self, 
+        player_id: int, 
+        context: PlayContext, 
+        target: Pose2D, 
+        reason: str, 
+        arrive_distance: float | None = None, 
+        hold_vyaw: float = 0.0, 
+        avoid_opponents: bool = False, 
+    ) -> RobotCommand: 
+ 
+        robot = context.teammates.get(player_id) 
+        if robot is None or robot.pose is None: 
+            return RobotCommand.stop(f"{reason}: waiting for pose") 
+     
+    return self._compute_velocity( 
+            robot.pose, 
+            target, 
+            "", 
+            arrive_distance, 
+            hold_vyaw, 
+        ) 
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22\n\n--- PAGE 6 ---\n附录：相关配置参数速查
+参数可在src/soccer_framework/config.py 中修改。
+类型 参数 默认值 说明
+速度上限 max_linear_speed 0.8m/s 线速度硬上限，motion层clamp
+速度上限 max_angular_speed 1.0rad/s ⻆速度硬上限，motion层clamp
+⾏⾛控制 _ARRIVE_DISTANCE 0.15m 距⽬标15cm内认为到达
+⾏⾛控制 _ARRIVE_ANGLE 0.20rad
+(~11.5°)
+朝向误差11.5°内认为对⻬
+
+⾏⾛控制 _TURN_THRESHOLD 0.5rad
+(~28.6°)
+⼤于此值纯转向，不⼤于则前进+转向
+⾏⾛控制 _ANGULAR_SPEED_FLOOR 0.25rad/s ⻆速度最低保底（死区外）
+⾏⾛控制 _ANGULAR_DEAD_ZONE 0.15rad
+(~8.6°)
+⼩于此值纯⽐例控制，不施floor
+⾏⾛控制 _LINEAR_SPEED_FLOOR 0.3m/s 线速度最低保底
+⾏⾛控制 _LINEAR_GAIN 0.9 vx=0.9×distance×cos(error)
+路径绕⾏ opponent_obstacle_radius 0.55m 对⼿障碍半径（直径1.1m）
+路径绕⾏ teammate_obstacle_radius 0.48m 队友障碍半径（直径0.96m）
+路径绕⾏ obstacle_safety_margin 0.22m 障碍半径之外的额外安全余量
+路径绕⾏ obstacle_start_ignore_distan
+ce
+0.35m 离起点这么近的障碍忽略（贴⾝不抖）
+路径绕⾏ obstacle_target_ignore_dista
+nce
+0.35m 离⽬标这么近的障碍忽略（到位不卡）
+转向避让 yaw_avoid_horizon_sec 1.0s 向前预测近邻轨迹的时⻓
+转向避让 yaw_avoid_min_distance_m 0.78m 当前/预测距离<此值才施加偏置
+转向避让 yaw_avoid_bias_max 0.6rad/s 单个近邻产⽣的最⼤vyaw偏置（按scale衰
+减）

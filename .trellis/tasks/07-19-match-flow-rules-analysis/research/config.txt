@@ -1,0 +1,517 @@
+--- PAGE 1 ---\n配置参数指南
+Englishversion: ConfigurationParameterGuide
+https://www.bilibili.com/video/BV1FtMx6bEtk
+本⽂档帮助参赛选⼿理解项⽬配置项的含义与影响。并能够根据⾃⼰的战术意图，快速查阅，精准调
+整参数。
+1.配置体系概览
+MyAgent的配置分为两层：
+层级 类 ⽂件 控制内容
+战术调参 SoccerStrategyTuni
+ng 
+config.py  速度上限、踢球迟滞、避障半径、传球阈值、带球推
+进、接应站位等
+整队配置 SoccerConfig  config.py  场地尺⼨、队伍ID、机器⼈名字、控制频率、初始站
+位等
+配置的加载⼊⼝是 SoccerConfig.from_env() （main.py 中调⽤），它从环境变量读取队
+伍ID和机器⼈名字，其余字段⾛默认值。参赛者在调试时直接修改 SoccerStrategyTuning 的
+默认值，或在构造 SoccerConfig 时传⼊⾃定义参数：
+代码块
+from src.soccer_framework import SoccerConfig, SoccerStrategyTuning 
+ 
+tuning = SoccerStrategyTuning( 
+    max_linear_speed=1.0, 
+    pass_min_score=0.45, 
+    dribble_advance_m=1.5, 
+) 
+config = SoccerConfig(team_id=1, strategy=tuning) 
+注意：修改后须重新运⾏ main.py ⽣效。
+2.config.py参数速查表
+1
+2
+3
+4
+5
+6
+7
+8\n\n--- PAGE 2 ---\n2.1速度上限
+控制机器⼈最⼤速度，是MotionController的上限——任何⾏⾛命令都不能超过。
+参数名 类型 默认
+值
+取值⽰例 解释 影响说明
+strategy.max_linear_spee
+d 
+
+float 0.8 0.6~1.2 线速度上限
+（m/s）
+调⼤→机器⼈跑更快，但急
+停容易超调、底盘不稳；调
+⼩→步伐更稳，但追不上快
+球
+strategy.max_angular_spe
+ed 
+float 1.0 0.6~1.5 ⻆速度上限
+（rad/s）
+调⼤→转⾝更快，但容易抖
+舵；调⼩→转弯平滑，但绕
+弯慢
+相关模块：
+tactics/motion.py 的 _compute_velocity ⽅法中使⽤ clamp(linear, 0, 
+max_linear_speed) 和 clamp(angular, -max_angular_speed, 
+max_angular_speed) 避免速度超越限制。
+2.2踢球迟滞
+踢球状态机（KickHysteresis ）⽤进⼊/退出双阈值+延迟实现防抖，避免机器⼈在距离边界上
+来回横跳。
+参数名 类型 默认值 取值⽰
+例
+解释 影响说明
+strategy.soccer_ki
+ck_enter_distance 
+float 2.5 2.0~3.0 距球⼩于此值即进
+⼊踢球模式（m）
+调⼤→更早进⼊踢球态，但可
+能在远处"空踢"；调⼩→更逼
+近才踢，但可能被对⼿先破坏
+strategy.soccer_ki
+ck_exit_distance 
+float 3.0 2.5~3.5 距球⼤于此值才考
+虑退出踢球（m）
+必须>enter，形成迟滞窗⼝。
+调⼤→更难退出，持球更持久
+strategy.soccer_ki
+ck_exit_delay_sec 
+float 1.5 0.5~3.0 满⾜退出条件后还
+要等多久才真退出
+（秒）
+调⼤→球弹开后仍保持踢球态
+更久，适合乱战；调⼩→更快
+放弃，更快转成追球
+strategy.soccer_ki
+ck_power 
+float 1.5 0.8~2.5 踢球⼒度 调⼤→射⻔/传球更有⼒量，
+球速更快；调⼩→更精确但推
+进慢\n\n--- PAGE 3 ---\nstrategy.soccer_ki
+ck_min_active_sec 
+float 1.0 0.5~2.0 踢球状态最短保持
+时间（秒）
+防⽌踢/不踢边界瞬时切换导致
+底盘抖动
+相关模块：
+tactics/kick_hysteresis.py 的 in_kick_range ⽅法实现完整的状态机逻辑：
+代码块
+  距离  <= enter  →  进⼊  active 
+  已  active 且  距离  <= exit →  保持  active 
+  已  active 且  距离  > exit →  开始计时，延迟不到则保持  active 
+  已  active 且  距离  > exit 且  延迟  >= exit_delay →  退出  active 
+2.3定位球/重启
+参数名 类型 默认值 取值⽰例 解释 影响说明
+strategy.restart_t
+ouch_distance 
+float 0.45 0.3~0.6 距球多近算"已触
+球"（触发restart推
+进）（m）
+调⼤→更易判为已触
+球，重启推进更快；调
+⼩→需要更靠近才算触
+球
+strategy.opponent_
+restart_avoid_dist
+ance_m 
+float 1.60 1.45~2.5
+
+对⽅重启时本队球员必
+须退到球外多远处
+（m）
+规则要求1.45m，默认
+加0.15m余量。调⼤
+→离球更远、更安全但
+可能漏⼈；调⼩→站位
+更紧但可能被裁判吹
+相关模块：
+tactics/targeting/restart.py 中的 _radius_safe 和
+opponent_restart_target ；tactics/targeting/attack.py 中的
+should_make_restart_touch 。
+2.4路径绕⾏（Via点）
+这是移动控制的第⼀层避障：从当前位置画⼀条直线到⽬标，中途若有障碍（对⼿/队友/球⻔）落在路
+径上，就在侧⾯算⼀个via点，让机器⼈绕过去。
+参数名 类型 默认值 取值⽰例 解释 影响说明
+float 0.55 0.40~0.70
+1
+2
+3
+4\n\n--- PAGE 4 ---\nstrategy.opponent
+_obstacle_radius 
+把对⼿当作多⼤半径的
+圆（m）
+调⼤→离对⼿更远，
+更安全但更绕路；调
+⼩→更敢贴⾝穿插
+strategy.teammate
+_obstacle_radius 
+float 0.48 0.35~0.60 把队友当作多⼤半径的
+圆（m）
+队友⽐对⼿⼩（同队更
+可预测）。调⼤→队
+友间保持更多距离
+strategy.obstacle
+_safety_margin 
+float 0.22 0.10~0.35 障碍半径之外再加的安
+全余量（m）
+实际绕⾏半径=
+obstacle_radius+
+safety_margin。调⼤
+→离障碍更远
+strategy.obstacle
+_start_ignore_dis
+tance 
+float 0.35 0.20~0.50 距起点多近的障碍忽略
+（m）
+防⽌贴⾝的障碍导致路
+径抖动
+strategy.obstacle
+_target_ignore_di
+stance 
+float 0.35 0.20~0.50 距⽬标点多近的障碍忽
+略（m）
+防⽌障碍在⽬标点旁边
+卡住机器⼈不让他到位
+相关模块：
+tactics/motion.py 的 _avoidance_target 和 _first_blocking_obstacle 
+tactics/navigation.py 的 ObstacleCollector 
+2.5转向避让（Vyaw偏置）
+这是移动控制的第三层避障：不改⽬标位置，只在⾏⾛时给⻆速度加偏置，让机器⼈微微侧⾝，从近
+邻旁边"擦过"。只动vyaw，不动vy（因为双⾜底盘vx+vyaw是最稳的组合）。
+参数名 类型 默认
+值
+取值⽰例 解释 影响说明
+strategy.yaw_avoi
+d_horizon_sec 
+float 1.0 0.5~2.0 向前预测近邻轨迹的时
+⻓（秒）
+调⼤→预测更远，提
+前避让；调⼩→只关
+注眼前
+strategy.yaw_avoi
+d_min_distance_m 
+float 0.78 0.50~1.20 当前/预测距离⼩于此值
+才施加偏置（m）
+调⼤→更早偏转，但
+可能过度避让；调⼩
+→更敢贴⼈
+strategy.yaw_avoi
+d_bias_max 
+float 0.6 0.3~1.0 单个近邻产⽣的最⼤
+vyaw偏置（rad/s）
+调⼤→避让动作更明
+显；调⼩→避让更平
+滑但可能擦碰\n\n--- PAGE 5 ---\n相关模块：
+tactics/motion.py 的 _apply_yaw_avoidance ⽅法。
+算法逻辑：
+代码块
+对每个近邻： 
+  如果  近邻在当前机器⼈左侧  →  vyaw += bias_max * scale （右转避开） 
+  如果  近邻在当前机器⼈右侧  →  vyaw -= bias_max * scale （左转避开） 
+ 
+scale 由双重威胁评估决定： max( 当前距离威胁 , 预测最近距离威胁 ) 
+  距离越近  scale 越⼤，最⼤为  1.0 
+2.6抢球仲裁
+当多个队友都有资格抢球时（CENTER和SIDE同时想上），⽤平局仲裁决定最终谁当Chaser。
+参数名 类型 默认值 取值⽰例 解释 影响说明
+strategy.teammate_c
+hallenge_tie_margin_
+m 
+float 0.15 0.05~0.30 两队友抢球距
+离平局判定带
+（m）
+上⼀个Chaser的距离必
+须明显⼤于（over+
+0.15m）候选者才会换
+⼈。调⼤→更不爱换⼈，
+更稳定但可能错过更近的
+队友；调⼩→更快响应距
+离变化，但可能在边界上
+来回切换
+相关模块：
+play/playbook.py 的 select_chaser ⽅法。
+2.7传球
+控制传球候选的评分与筛选逻辑。
+参数名 类型 默认值 取值⽰例 解释 影响说明
+strategy.pass_enab
+led 
+bool True True/False 传球总开关 False=永不带球，直接
+带球/射⻔
+1
+2
+3
+4
+5
+6\n\n--- PAGE 6 ---\nstrategy.pass_min_
+score 
+float 0.52 0.40~0.70 传球候选最低评
+分（低于此则改
+带球）
+调低→更多传球，但可
+能传到差位置；调⾼→
+只传给"好位置"，更保
+守
+strategy.pass_min_
+forward_m 
+float 0.35 0.0~1.0 传球⾄少向前推
+进的距离（m）
+调⼤→不⿎励横向/回
+传，更进取；调⼩（甚
+⾄负数）→允许回传，
+更保守
+strategy.pass_lane
+_clearance 
+float 0.75 0.50~1.20 传球路线两侧需
+要的净空（m）
+调⼤→只传"⼤空位"，
+更安全；调⼩→敢传险
+球，可能被截
+相关模块：
+tactics/targeting/attack.py 的 best_pass_target 和lane_clear_score 。
+传球评分体系：
+代码块
+总分  = 通路评分  × 0.55 + 推进评分  × 0.30 + 中路偏好  × 0.15 
+ 
+通路评分：传球路线两侧有多少障碍物，越⼲净越⾼ 
+推进评分：传球终点⽐起点前进了多少，前进越多越⾼ 
+中路偏好：传球终点越靠近中场线越⾼ 
+2.8带球
+当没有传球/射⻔⽬标时，带球兜底。
+参数名 类型 默认
+值
+取值⽰例 解释 影响说明
+strategy.dribble_a
+dvance_m 
+float 1.15 0.80~2.00 单次带球向前推进的距离
+（m）
+调⼤→每次带得更远，
+更⼤胆；调⼩→步⼦
+⼩，更稳但推进慢
+strategy.dribble_c
+enter_pull 
+float 0.65 0.0~1.20 带球往中线⽅向的拉⼒ 调⼤→边路带球更往中
+路靠（更好的射⻔⻆
+度）；调⼩→更靠边路
+相关模块：
+1
+2
+3
+4
+5\n\n--- PAGE 7 ---\ntactics/targeting/attack.py 的 dribble_target `。
+2.9接应站位
+控制不持球的队友（Supporter）的站位。
+参数名 类型 默认值 取值⽰例 解释 影响说明
+strategy.suppor
+t_depth_m 
+float
+
+1.05 0.50~2.00 接应者相对持球者的纵深
+（m）
+调⼤→站得离球更远，
+安全但接应慢；调⼩→
+贴得更近，⼆过⼀更快但
+被断球⻛险⾼
+strategy.suppor
+t_lateral_m 
+float 1.25 0.50~2.50 接应者横向拉开距离
+（m）
+调⼤→更靠边路，拉开
+场地宽度；调⼩→更靠
+近中路
+strategy.suppor
+t_min_spacing_m 
+float 1.15 0.80~1.80 队友间最⼩间距（m） 防⽌扎堆。调⼤→队友
+间保持更远距离
+相关模块：
+tactics/targeting/support.py 的 support_target 和
+_spaced_support_target 。
+2.10⻔将出击
+参数名 类型 默认
+值
+取值⽰例 解释 影响说明
+strategy.goalkeeper
+_challenge_margin_m 
+float 0.70
+
+0.30~1.50 ⻔将出击上抢的
+触发余量（m）
+⻔将出击的区域=罚球区
+宽度/2+margin。调⼤→
+⻔将更早冲出解围（激
+进）；调⼩→⻔将更保守
+死守球⻔线
+相关模块：
+tactics/targeting/predicates.py 的 ball_in_own_defensive_area 
+play/playbook.py 的 _slot_can_challenge 。
+⻔将出击区域判定公式：
+代码块\n\n--- PAGE 8 ---\narea_x = -field_length * 0.18   # 约  -1.26m （从场中⼼算） 
+area_y = min(field_width/2 - 0.35, penalty_area_width/2 + 
+goalkeeper_challenge_margin_m) 
+# area_y = min(4.15, 2.5 + 0.70) = 3.20m 
+2.11边线/球⻔线脱困
+当球贴近边线或越过球⻔线时，不⾛常规进攻评分，⽽是⽤"硬性恢复"⽬标把球拉回场内。
+参数名 类型 默认值 取值⽰例 解释 影响说明
+strategy.sideline_r
+ecovery_margin_m 
+float 0.90 0.50~1.50 离边线多近触发
+脱困（m）
+调⼤→更早触发脱困（更
+保守）；调⼩→更敢贴边
+strategy.sideline_r
+ecovery_infield_m 
+float 1.60 1.00~2.50 脱困时往场内回
+收多深（m）
+调⼤→把球拉得更靠场
+内；调⼩→回收幅度⼩
+strategy.sideline_r
+ecovery_advance_m 
+float 0.75 0.30~1.50 脱困时同时向前
+推进多少（m）
+调⼤→边线脱困时更进
+取；调⼩→更保守先拉回
+场内再说
+strategy.goal_line_
+recovery_margin_m 
+float 0.08 0.05~0.20 离球⻔线多近触
+发脱困（m）
+很⼩，防⽌球越过底线后
+被吹出界
+相关模块：
+tactics/targeting/predicates.py 的 ball_near_sideline 
+tactics/targeting/recovery.py 的 sideline_recovery_target 
+3.场地与球队配置（SoccerConfig）
+这些参数在 SoccerConfig 中定义，部分从环境变量注⼊，部分来⾃规则固定值。
+参数名 类型 默认值 来源 解释
+team_id  int 1 环境变量
+SOCCER_TEAM_ID 
+队伍编号：1或2
+robot_names  tuple[str] ("robot1","robot
+2","robot3")
+环境变量
+SOCCER_ROBOT_NAM
+ES 
+本队机器⼈名字，逗号
+分隔
+1
+2
+3\n\n--- PAGE 9 ---\nopponent_robot_nam
+es 
+tuple[str] ("robot4","robot
+5","robot6")
+环境变量
+SOCCER_OPPONENT_
+ROBOT_NAMES 
+对⼿机器⼈名字
+ready_slots  dict {1:CENTER,2:
+SIDE,3:KEEPER}
+代码默认 球员ID→ReadySlot映
+射
+control_hz  float 30.0 环境变量
+SOCCER_CONTROL_H
+Z 
+控制循环频率（Hz）
+game_controller_to
+pic 
+str "/soccer/game_c
+ontroller"
+环境变量 GC的ROStopic
+field_length  float 14.0 规则固定 场地⻓度（m）
+field_width  float 9.0 规则固定 场地宽度（m）
+goal_width  float 2.6 规则固定 球⻔宽度（m）
+penalty_dist  float 1.5 规则固定 罚球点距球⻔线距离
+（m）
+center_circle_radi
+us 
+float 1.5 规则固定 中圈半径（m）
+penalty_area_lengt
+h 
+float 2.0 规则固定 罚球区⻓度（m）
+penalty_area_widt
+h 
+float 5.0 规则固定 罚球区宽度（m）
+goal_area_length  float 1.0 规则固定 球⻔区⻓度（m）
+goal_area_width  float 3.0 规则固定 球⻔区宽度（m）
+注意：场地尺⼨由 soccer_framework/types.py 的 ADULT_FIELD_DIMENSIONS 定义，
+是3v3规则硬编码的。如果⽐赛场地尺⼨改变，需同步修改该常量。
+4.运动控制器硬编码常量
+以下常量在 tactics/motion.py 中硬编码（不在 SoccerStrategyTuning 中），但在理解
+移动⾏为时⾄关重要：
+常量 值 ⽤途\n\n--- PAGE 10 ---\n_ARRIVE_DISTANCE  0.15m 到达判定：距⽬标点⼩于此值算"已到达"
+_ARRIVE_ANGLE  0.12rad 对⻬判定：朝向误差⼩于此值算"已对⻬"
+_ARRIVE_STOP_ANGLE  0.5rad ⻆度误差⼤于此值阻⽌前进（原地转向）
+_ARRIVE_SPEED_ANGLE  0.9rad ⻆度误差⼤于此值将线速度完全裁为0
+_ANGULAR_DEAD_ZONE  0.15rad ⻆度死区：误差⼩于此值时不输出⻆速度
+_LINEAR_SPEED_FLOOR  0.15m/s 线速度下限：不会输出低于此值的线速度
+_AVOID_DIST_EPS  0.05m 避障距离微调量
+_KICK_STEP_ANGLE  0.65rad 踢球时最⼤转向步⻓
+5.场景实战指南
+5.1更激进地进攻
+场景描述：你的球队现在打法太保守，经常在中场做⽆效传递，你希望队员更快地向前推进、更果断
+地射⻔。
+建议调整：
+参数 调整⽅向 新值建议 理由
+max_linear_speed  调⼤ 1.0~1.2 跑得更快=反击更快
+dribble_advance_m  调⼤ 1.5~2.0 每次带球推得更远，更快逼近球⻔
+pass_min_forward_m  调⼤ 0.6~0.8 不⿎励横传/回传，只传向前推进明显的球
+pass_min_score  调低 0.42~0.48 降低传球⻔槛，更多射⻔/传球候选
+support_depth_m  调⼩ 0.6~0.8 接应者更靠前，⼆过⼀打得更快
+sideline_recovery_ad
+vance_m 
+调⼤ 1.0~1.2 边线解围时也往前推
+预期效果：球队整体往前压，接应更快，带球推进更远，射⻔机会更多。但后防线可能更脆弱，容易
+被反击打穿。
+5.2想让防守更稳固
+场景描述：你的球队防守时容易被对⼿过掉、⻔将出击判断不准，你希望整体防守更稳健。
+建议调整：\n\n--- PAGE 11 ---\n参数 调整⽅向 新值建议 为什么
+opponent_obstacle_radius  调⼤ 0.65~0.70 绕对⼿时保持更远距离，降低被过的⻛险
+obstacle_safety_margin  调⼤ 0.28~0.35 更宽的绕⾏通道
+support_depth_m  调⼤ 1.4~1.6 接应者更靠后，回防更快
+goalkeeper_challenge_margin
+_m 
+调⼩ 0.40~0.55 ⻔将更保守，只在更危险的区域才出击
+yaw_avoid_min_distance_m  调⼤ 0.90~1.10 更远距离就开始偏转避让对⼿
+yaw_avoid_bias_max  调⼤ 0.70~0.85 避让动作更明显
+soccer_kick_exit_delay_sec  调⼤ 2.0~2.5 球弹开后仍保持踢球态更久，适合防守解
+围
+预期效果：防守时更注重距离控制，⻔将更稳健，解围更及时。但反击速度可能变慢。
+5.3想让移动更流畅
+场景描述：你的机器⼈经常在场上犹豫不决，出现绕远路、抖动等现象，看起来不够流畅。
+建议调整：
+参数 调整⽅向 新值建议 为什么
+opponent_obstacle_radius  调⼩ 0.40~0.48 减少不必要的绕⾏
+teammate_obstacle_radius  调⼩ 0.38~0.44 队友间更紧凑，路径更短
+obstacle_safety_margin  调⼩ 0.12~0.18 减少绕⾏冗余
+obstacle_start_ignore_distanc
+e 
+调⼤ 0.4~0.5 起点附近障碍不再触发绕
+⾏，减少抖动
+yaw_avoid_min_distance_m  调⼩ 0.50~0.65 只在更贴近时才偏转
+yaw_avoid_bias_max  调⼩ 0.35~0.50 偏转幅度更⼩，⾛得更直
+soccer_kick_enter_distance  与exit拉开差距 enter=2.2,
+exit=3.2
+迟滞窗⼝1.0m，减少踢/⾛
+的边界抖动
+soccer_kick_min_active_sec  调⼤ 1.3~1.5 减少踢球态与⾏⾛态间的快
+速切换\n\n--- PAGE 12 ---\nteammate_challenge_tie_margin
+_m 
+调⼤ 0.20~0.25 减少Chaser频繁换⼈
+预期效果：机器⼈⾛路更直、转弯更少、到达⽬标后更少抖动。但贴⼈可能太近，被断球的⻛险略
+增。
+5.4想让传球/射⻔更精准
+场景描述：你的球队经常传球被截、射⻔打偏或打不进，希望提⾼传球成功率和射⻔质量。
+建议调整：
+参数 调整⽅向 新值建议 为什么
+pass_lane_clearance  调⼤ 0.85~1.00 只传给通道更宽的队友，减少被截
+pass_min_score  调⾼ 0.58~0.65 只传给评分最⾼的候选
+pass_enabled  确保为True True 传球总开关打开
+soccer_kick_power  调⼤ 1.8~2.2 射⻔/传球⼒度更强，球速更快
+shot_lane_is_clear  调⾼ 0.60~0.65 射⻔路径需要更⼲净
+dribble_center_pull  调⼤ 0.80~1.00 边路带球更往中路靠，射⻔⻆度更好
+注：shot_lane_is_clear 的阈值0.55在 tactics/targeting/attack.py 中硬编码，
+需要修改代码。
+预期效果：传球成功率提升，射⻔更有威胁。但可能错过⼀些冒险的机会。
+演⽰案例
+建议演⽰场景：修改 SoccerStrategyTuning 的 soccer_kick_power （当前1.5，可尝试
+5.0）对⽐射⻔⼒度变化。修改后重新运⾏main.py 即可在仿真中观察效果。

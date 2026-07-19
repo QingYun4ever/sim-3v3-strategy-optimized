@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Manually review that the 1.5m rule has one authoritative parameter and restart geometry is not duplicated across branches."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Manually trace game-control fields through get_phase and opponent-restart dispatch to confirm referee authority is preserved."}

@@ -25,7 +25,7 @@ KICK_POWER_OUR_KICKOFF = 5.0
 # 我方中场固定开球专用力度。传球和二脚射门需要分别仿真标定，不能复用
 # 普通射门、后场解围或守门员解围力度。
 KICKOFF_PASS_POWER = 1.1
-KICKOFF_SHOT_POWER = 6.5
+KICKOFF_SHOT_POWER = 7.0
 
 
 # ======================================================================
@@ -258,7 +258,7 @@ KICKOFF_LATERAL_TOL = 0.35
 # T08 我方中场固定开球：基准方案为 passer 在 +Y、shooter 在 -Y，镜像时 y 取反。
 KICKOFF_PASSER_SETUP_X_M = -0.65
 KICKOFF_PASSER_SETUP_Y_M = 1.80
-KICKOFF_SHOOTER_SETUP_X_M = -2.4
+KICKOFF_SHOOTER_SETUP_X_M = -2.6
 KICKOFF_SHOOTER_SETUP_Y_M = -2.3
 KICKOFF_RECEIVE_TARGET_X_M = 0.8
 KICKOFF_RECEIVE_TARGET_Y_M = -2.2

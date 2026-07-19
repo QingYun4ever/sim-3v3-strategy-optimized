@@ -4421,23 +4421,11 @@ def _act_our_kickoff(
             _abort_kickoff_tactic(context, store, "ball_unknown")
             _draw_kickoff_tactic(context, store)
             return
-        can_attempt = (
-            getattr(store, "kickoff_last_pass_attempt_at", None) is None
-            or context.now - store.kickoff_last_pass_attempt_at
-            >= KICKOFF_PASS_RETRY_INTERVAL_SEC
-        )
-        if can_attempt:
-            store.kickoff_pass_start_ball = (ball.x, ball.y)
-            store.kickoff_pass_start_seen_at = (
-                ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
-            )
-            store.kickoff_pass_attempts += 1
-            store.kickoff_last_pass_attempt_at = context.now
-        if getattr(store, "kickoff_pass_attempts", 0) > KICKOFF_PASS_MAX_RETRIES:
+        if getattr(store, "kickoff_pass_attempts", 0) >= KICKOFF_PASS_MAX_RETRIES:
             _abort_kickoff_tactic(context, store, "pass_retry_exhausted")
             _draw_kickoff_tactic(context, store)
             return
-        _command_kickoff_direct_touch(
+        kicked = _command_kickoff_direct_touch(
             passer,
             roles.receive_target,
             KICKOFF_PASS_POWER,
@@ -4447,6 +4435,13 @@ def _act_our_kickoff(
             ball_bearing_tolerance=KICKOFF_PASS_BALL_BEARING_RAD,
             approach_behind=KICKOFF_PASS_APPROACH_BEHIND_M,
         )
+        if kicked:
+            store.kickoff_pass_start_ball = (ball.x, ball.y)
+            store.kickoff_pass_start_seen_at = (
+                ball.last_seen_at if ball.last_seen_at > 0.0 else context.now
+            )
+            store.kickoff_pass_attempts += 1
+            store.kickoff_last_pass_attempt_at = context.now
         shooter.walk_to(
             roles.receive_target,
             face=angle_to(
@@ -4459,11 +4454,12 @@ def _act_our_kickoff(
             arrive_dist=KICKOFF_READY_ARRIVE_M,
         )
         shooter.action = "kickoff:shooter_receive"
-        _enter_kickoff_state(
-            store,
-            KickoffTacticState.VERIFY_FIRST_TOUCH,
-            context.now,
-        )
+        if kicked:
+            _enter_kickoff_state(
+                store,
+                KickoffTacticState.VERIFY_FIRST_TOUCH,
+                context.now,
+            )
         _draw_kickoff_tactic(context, store)
         return
 

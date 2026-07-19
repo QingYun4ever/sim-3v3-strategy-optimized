@@ -934,6 +934,73 @@ class Player:
             arrive_dist=GOALKEEPER_CLEAR_ENTER_DISTANCE_M,
         )
 
+    def quick_defensive_clear(
+        self,
+        clearance_target: tuple[float, float],
+        power: float,
+    ) -> None:
+        """快速处理后场球，使用宽松对齐和短球后接近，不进入普通射门绕球流程。"""
+        self._reset_ball_approach()
+        context = self.context
+        ball = context.ball if context is not None else None
+        pose = self.pose
+        if context is None or ball is None or pose is None:
+            self.action = "defensive_clear:stop"
+            self.stop()
+            return
+
+        target_x = max(clearance_target[0], ball.x + 0.5)
+        safe_target = (target_x, clearance_target[1])
+        kick_direction = angle_to(ball.x, ball.y, *safe_target)
+        if math.cos(kick_direction) <= 0.0:
+            kick_direction = 0.0
+            safe_target = (ball.x + 1.0, ball.y)
+
+        ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+        desired_behind_angle = normalize_angle(kick_direction + math.pi)
+        player_angle_around_ball = angle_to(
+            ball.x,
+            ball.y,
+            pose.x,
+            pose.y,
+        )
+        alignment_error = abs(normalize_angle(
+            desired_behind_angle - player_angle_around_ball,
+        ))
+        ball_bearing = abs(normalize_angle(
+            angle_to(pose.x, pose.y, ball.x, ball.y) - pose.theta,
+        ))
+        can_kick_now = (
+            ball_distance <= DEFENSIVE_QUICK_KICK_ENTER_M
+            and alignment_error <= DEFENSIVE_QUICK_KICK_ALIGNMENT_RAD
+            and ball_bearing <= DEFENSIVE_QUICK_KICK_BALL_BEARING_RAD
+        )
+
+        self._draw_kick_target(safe_target)
+        if can_kick_now:
+            self.kick(kick_direction, power)
+            self.action = "defensive_clear:kick"
+            return
+
+        self.release_kick()
+        approach_target = _behind_ball(
+            ball.x,
+            ball.y,
+            safe_target,
+            DEFENSIVE_QUICK_APPROACH_BEHIND_M,
+        )
+        self.walk_to(
+            approach_target,
+            face=kick_direction,
+            avoid_ball=False,
+            avoid_robots=False,
+            arrive_dist=min(
+                ARRIVE_DIST,
+                DEFENSIVE_QUICK_APPROACH_BEHIND_M * 0.75,
+            ),
+        )
+        self.action = "defensive_clear:approach"
+
     def support(self) -> None:
         """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。
 

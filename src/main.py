@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from enum import Enum
 
 from booster_agent_framework import AgentBase
@@ -50,6 +51,26 @@ class Phase(Enum):
     OPP_SET_PLAY = "opp_set_play"  # 对方定位球(避让)
     READY = "ready"                # READY 走位
     STOPPED = "stopped"            # SET(非开球重开) / INITIAL / FINISHED / stopped
+
+
+class OpenPlayAvailability(Enum):
+    """普通比赛角色分配可使用的机器人数量。"""
+
+    FULL_THREE = "3_available"
+    DEGRADED_TWO = "2_available"
+    DEGRADED_ONE = "1_available"
+    UNAVAILABLE = "0_available"
+
+
+@dataclass(frozen=True)
+class OpenPlayRoleAssignment:
+    """一帧普通比赛的基础职责分配结果。"""
+
+    goalkeeper_id: int | None
+    primary_attacker_id: int | None
+    front_partner_id: int | None
+    available_player_ids: tuple[int, ...]
+    availability: OpenPlayAvailability
 
 
 def get_phase(context: Context) -> Phase:
@@ -141,6 +162,17 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.current_goalkeeper_id = None
         store.available_field_player_ids = ()
         store.can_run_two_player_tactic = False
+        store.latest_open_play_role_assignment = OpenPlayRoleAssignment(
+            goalkeeper_id=None,
+            primary_attacker_id=None,
+            front_partner_id=None,
+            available_player_ids=(),
+            availability=OpenPlayAvailability.UNAVAILABLE,
+        )
+        # 后续固定战术可以维护自己的锁定职责,不与普通比赛分配状态混用。
+        store.active_tactic = None
+        store.locked_roles = None
+        store.tactic_roles = None
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -363,6 +395,107 @@ def _select_closest_attacker(
     return best
 
 
+def _classify_open_play_availability(
+    available_player_count: int,
+) -> OpenPlayAvailability:
+    """把 3v3 可用人数映射为明确的普通比赛降级等级。"""
+    if available_player_count >= 3:
+        return OpenPlayAvailability.FULL_THREE
+    if available_player_count == 2:
+        return OpenPlayAvailability.DEGRADED_TWO
+    if available_player_count == 1:
+        return OpenPlayAvailability.DEGRADED_ONE
+    return OpenPlayAvailability.UNAVAILABLE
+
+
+def _assign_open_play_roles(
+    context: Context,
+    available_players: list[Player],
+    current_goalkeeper: Player | None,
+    store,
+) -> OpenPlayRoleAssignment:
+    """只从本帧 available 阵容分配守门员、主攻和前场搭档。"""
+    available_player_ids = tuple(
+        player.id for player in available_players
+    )
+    availability = _classify_open_play_availability(
+        len(available_players),
+    )
+    available_by_id = {
+        player.id: player for player in available_players
+    }
+    goalkeeper_id = (
+        current_goalkeeper.id
+        if current_goalkeeper is not None
+        and current_goalkeeper.id in available_by_id
+        else None
+    )
+    field_players = [
+        player for player in available_players
+        if player.id != goalkeeper_id
+    ]
+
+    primary_attacker_id = None
+    front_partner_id = None
+    if len(available_players) == 1:
+        if goalkeeper_id is None:
+            primary_attacker_id = available_players[0].id
+            store.normal_attacker = primary_attacker_id
+    elif len(available_players) >= 2 and field_players:
+        primary_attacker = _select_closest_attacker(
+            context,
+            field_players,
+            getattr(store, "normal_attacker", None),
+        )
+        primary_attacker_id = primary_attacker.id
+        store.normal_attacker = primary_attacker_id
+
+        if len(available_players) >= 3:
+            front_partner = next(
+                (
+                    player for player in field_players
+                    if player.id != primary_attacker_id
+                ),
+                None,
+            )
+            front_partner_id = (
+                front_partner.id if front_partner is not None else None
+            )
+
+    assignment = OpenPlayRoleAssignment(
+        goalkeeper_id=goalkeeper_id,
+        primary_attacker_id=primary_attacker_id,
+        front_partner_id=front_partner_id,
+        available_player_ids=available_player_ids,
+        availability=availability,
+    )
+    store.latest_open_play_role_assignment = assignment
+    return assignment
+
+
+def _get_assigned_player(
+    available_players_by_id: dict[int, Player],
+    player_id: int | None,
+) -> Player | None:
+    """按角色结果中的 ID 取得本帧 available Player。"""
+    if player_id is None:
+        return None
+    return available_players_by_id.get(player_id)
+
+
+def _act_normal_primary_attacker(attacker: Player) -> None:
+    """执行原有 attack,并在标签中保留其内部追球子动作。"""
+    attacker.action = "attack"
+    attacker.attack()
+    attacker.action = f"normal:primary_attacker:{attacker.action}"
+
+
+def _act_normal_front_partner(front_partner: Player) -> None:
+    """执行原有 support,并标明普通比赛前场搭档职责。"""
+    front_partner.support()
+    front_partner.action = "normal:front_partner:support"
+
+
 def _act_normal(
     context: Context,
     players: list[Player],
@@ -371,24 +504,43 @@ def _act_normal(
     *,
     allow_ball_search: bool = True,
 ) -> None:
-    """NORMAL:当前守门员守门,场上球员沿用 attacker/support 入口。
+    """NORMAL:消费基础职责分配并执行现有 guard/attack/support 动作。
 
-    ``players`` 是本帧可行动球员(已就绪、pose 已知),这里直接挑角色并执行。
+    固定战术未来可在调用本入口前独立分派,从而绕过普通比赛角色分配。
     """
-    if not players:
+    assignment = _assign_open_play_roles(
+        context, players, goalkeeper, store,
+    )
+    available_players_by_id = {
+        player.id: player for player in players
+    }
+    role_goalkeeper = _get_assigned_player(
+        available_players_by_id, assignment.goalkeeper_id,
+    )
+    primary_attacker = _get_assigned_player(
+        available_players_by_id, assignment.primary_attacker_id,
+    )
+    front_partner = _get_assigned_player(
+        available_players_by_id, assignment.front_partner_id,
+    )
+    assigned_field_players = [
+        player for player in (primary_attacker, front_partner)
+        if player is not None
+    ]
+
+    if assignment.availability == OpenPlayAvailability.UNAVAILABLE:
         return
 
-    role_goalkeeper = goalkeeper
-    field_players = [
-        player for player in players if player is not role_goalkeeper
-    ]
-    if len(players) == 1:
-        only_player = players[0]
-        if _should_single_player_guard(context, only_player):
-            _act_goalkeeper_guard(only_player, store)
-            return
-        role_goalkeeper = None
-        field_players = [only_player]
+    assigned_player_ids = {
+        player.id for player in assigned_field_players
+    }
+    if role_goalkeeper is not None:
+        assigned_player_ids.add(role_goalkeeper.id)
+    for player in players:
+        if player.id in assigned_player_ids:
+            continue
+        player.action = "normal:unassigned"
+        player.stop()
 
     ball_confirmed = (
         _update_ball_recovery_state(context, store)
@@ -397,33 +549,22 @@ def _act_normal(
     if not ball_confirmed:
         if allow_ball_search:
             _act_ball_recovery(
-                context, field_players, role_goalkeeper, store,
+                context, assigned_field_players, role_goalkeeper, store,
             )
         else:
             if role_goalkeeper is not None:
                 _act_goalkeeper_guard(role_goalkeeper, store)
-            for player in field_players:
+            for player in assigned_field_players:
                 player.action = "ball_unknown:stop"
                 player.stop()
         return
 
     if role_goalkeeper is not None:
         _act_goalkeeper_guard(role_goalkeeper, store)
-    if not field_players:
-        return
-
-    attacker = _select_closest_attacker(
-        context, field_players, getattr(store, "normal_attacker", None),
-    )
-    store.normal_attacker = attacker.id
-    attacker.action = "attack"
-    attacker.attack()
-
-    for player in field_players:
-        if player is attacker:
-            continue
-        player.action = "support"
-        player.support()
+    if primary_attacker is not None:
+        _act_normal_primary_attacker(primary_attacker)
+    if front_partner is not None:
+        _act_normal_front_partner(front_partner)
 
 
 def _act_goalkeeper_guard(goalkeeper: Player, store) -> None:
@@ -433,25 +574,6 @@ def _act_goalkeeper_guard(goalkeeper: Player, store) -> None:
         goalkeeper.action = "temp_goalkeeper:guard"
     else:
         goalkeeper.action = "goalkeeper:guard"
-
-
-def _should_single_player_guard(context: Context, player: Player) -> bool:
-    """单人降级时,球门危险或机器人已在门前则优先守门。"""
-    ball = context.ball
-    if ball is None:
-        return True
-
-    own_penalty_edge_x = (
-        -context.field.length / 2.0 + context.field.penalty_area_length
-    )
-    if ball.x <= own_penalty_edge_x:
-        return True
-
-    own_goal_x, own_goal_y = own_goal(context)
-    goal_protection_distance = context.field.penalty_area_length + 0.5
-    return dist(
-        player.pose.x, player.pose.y, own_goal_x, own_goal_y,
-    ) <= goal_protection_distance
 
 
 def _update_ball_recovery_state(context: Context, store) -> bool:

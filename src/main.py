@@ -3807,12 +3807,14 @@ def _should_finish_kickoff_second_touch(context: Context, store) -> bool:
     if state != KickoffTacticState.VERIFY_FIRST_TOUCH:
         return False
 
-    # 不能只凭本地状态或倒计时延续战术；必须观测到第一脚确实把球
-    # 朝锁定接球点送出，才允许在开放比赛中完成第二次触球。
-    return _kickoff_ball_has_moved_toward_receive(
-        context,
-        store,
-        roles.receive_target,
+    # 裁判机可能在刚检测到触球时立即切入 NORMAL，而球的下一次观测
+    # 尚未累计到 0.20m 确认距离。只要本次第一脚确实已经下发，就保留
+    # VERIFY_FIRST_TOUCH；实际方向和位移仍由该状态逐帧确认，超时仍按
+    # 战术失败处理。这里不使用本地时间推断裁判窗口是否开放。
+    return (
+        getattr(store, "kickoff_pass_attempts", 0) > 0
+        and getattr(store, "kickoff_pass_start_ball", None) is not None
+        and getattr(store, "kickoff_pass_start_seen_at", None) is not None
     )
 
 

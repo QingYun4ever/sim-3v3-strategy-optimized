@@ -4134,12 +4134,19 @@ def _command_kickoff_direct_touch(
         angle_to(pose.x, pose.y, ball.x, ball.y) - pose.theta,
     ))
     ball_distance = dist(pose.x, pose.y, ball.x, ball.y)
+    kickoff_passer_must_touch_now = (
+        action_prefix == "kickoff:passer_kick"
+        and ball_distance <= KICKOFF_PASS_KICK_DISTANCE_M
+    )
 
     player._draw_kick_target(target)
     if (
-        ball_distance <= kick_distance
-        and alignment_error <= alignment_tolerance
-        and ball_bearing <= ball_bearing_tolerance
+        kickoff_passer_must_touch_now
+        or (
+            ball_distance <= kick_distance
+            and alignment_error <= alignment_tolerance
+            and ball_bearing <= ball_bearing_tolerance
+        )
     ):
         player.kick(kick_direction, power)
         player.action = f"{action_prefix}:kick"

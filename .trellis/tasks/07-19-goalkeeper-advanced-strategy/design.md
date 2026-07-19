@@ -9,7 +9,7 @@
 - `src/param.py` 保存所有状态阈值、几何余量、超时和解围力度。
 - `src/framework/`、ROS、GameController 和 Backend 不修改。
 
-守门员身份仍由 `_select_current_goalkeeper()` 每帧统一决定。高级策略只消费该结果，不拥有身份选择权。
+守门员身份仍由 `_select_current_goalkeeper()` 每帧统一决定。高级策略只可写入“下一帧交接请求”，不得在本帧动作执行中途直接改写当前守门员，避免同一帧出现双守门或空门职责。
 
 ## Goalkeeper State Contract
 
@@ -34,8 +34,36 @@
 - `goalkeeper_ball_speed`
 - `goalkeeper_target`
 - `goalkeeper_clearance_target`
+- `goalkeeper_clear_kicked_at`
+- `goalkeeper_clear_ball_x_at_kick`
+- `goalkeeper_handover_candidate_id`
+- `goalkeeper_handover_requested_at`
+- `goalkeeper_last_handover_at`
+- `goalkeeper_post_clear_attacker_id`
+- `goalkeeper_post_clear_attack_until`
 
 当前守门员 ID 变化时重置模式为 HOLD，并清除 challenge/clear 状态，避免临时守门员继承前一名守门员的出击状态。
+
+## Aggressive Post-Clear Handover
+
+解围动作首次进入 `kick` 子动作时记录球的 X 和时间。后续球观测满足以下条件时视为成功解围：
+
+- 球相对记录点产生可调的正 X 位移；
+- 首次踢球后经过短暂观察时间，避免球刚离脚便过早决定交接；
+- 球已经离开己方危险区；
+- 当前没有快速射门或位置威胁；
+- 球仍位于原守门员可在短时反击窗口内追赶的最大距离内；若大脚已经把球送远，则放弃交接；
+- 确认发生在短超时窗口内。
+
+从当前 available 场上机器人中选择距离动态 home 最近者。候选必须在最大接管距离内，并且相对原守门员对 home 具有可调位置优势。满足冷却时间后，高级策略写入 `goalkeeper_handover_candidate_id`，由下一帧 `_select_current_goalkeeper()` 原子应用：
+
+1. 候选仍 available 且 phase 仍为 NORMAL 时，将其写入 `temporary_goalkeeper_id`。
+   应用前重新估计当前球速和威胁，并重新检查球可见、球已离开危险区、原守门员到球距离、候选最大接管距离及相对原守门员的位置优势；任一条件失效则取消请求。
+2. 原守门员写入短时 `goalkeeper_post_clear_attacker_id`，并成为场上职责候选。
+3. 新守门员首次进入高级策略时因 ID 改变重置模式和速度历史。
+4. 原守门员在反击窗口内优先成为 primary attacker；若球重新进入己方危险区，危险区防守优先级立即恢复，不强制保持 ATTACKING。
+
+这是用户选择的激进策略：不等待候选完全到位，只要求其位置明显更适合守门。交接仍延迟到下一策略帧，以保持单帧职责一致性。
 
 ## Per-Frame Data Flow
 
@@ -169,7 +197,8 @@ CLEAR 不调用 `plan_kick()`，因为该方法只瞄准对方球门且无法表
 
 ## Compatibility
 
-- `_assign_open_play_roles()` 和 T06 模式估计不修改。
+- `_assign_open_play_roles()` 仅增加短时 post-clear attacker 优先入口；正常角色选择保持原有逻辑。
+- T06 模式估计保持原有证据与危险区抢占；反击窗口只在球不处于己方危险区时覆盖为进攻执行形态。
 - T04/T05/T06 只把原有 `goalkeeper.guard()` 调用替换为统一高级守门入口，场上机器人动作不变。
 - 我方开球/我方 set play 可使用 HOLD/TRACK，但禁止 CHALLENGE/CLEAR，以免本任务隐式改变固定战术；高级出击仅在 `Phase.NORMAL`。
 - 对方重启继续使用 `_walk_to_restart_target()`，不调用高级守门入口。
@@ -182,6 +211,9 @@ CLEAR 不调用 `plan_kick()`，因为该方法只瞄准对方球门且无法表
 - **快速球被误判为可解围**：状态优先级让快速射门 BLOCK 高于 CHALLENGE/CLEAR。
 - **解围横穿门前**：目标必须正 X 前移，Player 再检查方向正 X 分量。
 - **临时守门员继承旧状态**：current goalkeeper ID 变化时重置。
+- **激进交接造成空门**：要求成功解围、威胁消失、候选位于门前接管范围且明显更接近 home；身份只在下一帧统一切换。
+- **连续换位震荡**：加入交接冷却和位置优势阈值。
+- **球快速回到危险区**：危险区判断立即取消反击覆盖并恢复 T06 防守优先级。
 - **破坏 T01**：对方重启函数不改，不调用普通守门状态机。
 
 ## Rollback Shape

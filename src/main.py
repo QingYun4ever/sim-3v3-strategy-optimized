@@ -215,6 +215,13 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.goalkeeper_ball_speed = None
         store.goalkeeper_target = None
         store.goalkeeper_clearance_target = None
+        store.goalkeeper_clear_kicked_at = None
+        store.goalkeeper_clear_ball_x_at_kick = None
+        store.goalkeeper_handover_candidate_id = None
+        store.goalkeeper_handover_requested_at = None
+        store.goalkeeper_last_handover_at = None
+        store.goalkeeper_post_clear_attacker_id = None
+        store.goalkeeper_post_clear_attack_until = None
         store.player_availability = {}
         store.available_player_ids = ()
         store.default_goalkeeper_id = None
@@ -265,6 +272,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         )
         if current_goalkeeper is None or store.prev_phase != phase:
             _reset_goalkeeper_strategy(store)
+            _reset_goalkeeper_handover_state(store)
 
         # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
         if phase == Phase.NORMAL:
@@ -364,7 +372,7 @@ def _select_current_goalkeeper(
     phase: Phase,
     store,
 ) -> Player | None:
-    """选择并保持当前守门员,只在安全窗口交还默认守门员职责。"""
+    """统一选择守门员，并在 NORMAL 中原子应用已批准的主动交接。"""
     default_goalkeeper_id = _resolve_default_goalkeeper_id(context, all_players)
     store.default_goalkeeper_id = default_goalkeeper_id
 
@@ -375,6 +383,46 @@ def _select_current_goalkeeper(
     temporary_goalkeeper_id = getattr(
         store, "temporary_goalkeeper_id", None,
     )
+
+    pending_handover_id = getattr(
+        store, "goalkeeper_handover_candidate_id", None,
+    )
+    previous_goalkeeper_id = getattr(store, "current_goalkeeper_id", None)
+    if phase == Phase.NORMAL and pending_handover_id is not None:
+        handover_goalkeeper = available_by_id.get(pending_handover_id)
+        previous_goalkeeper = available_by_id.get(previous_goalkeeper_id)
+        if (
+            handover_goalkeeper is not None
+            and previous_goalkeeper is not None
+            and handover_goalkeeper.id != previous_goalkeeper_id
+            and _goalkeeper_handover_is_still_valid(
+                context,
+                previous_goalkeeper,
+                handover_goalkeeper,
+                store,
+            )
+        ):
+            temporary_goalkeeper_id = (
+                None
+                if handover_goalkeeper.id == default_goalkeeper_id
+                else handover_goalkeeper.id
+            )
+            store.goalkeeper_post_clear_attacker_id = previous_goalkeeper.id
+            store.goalkeeper_post_clear_attack_until = (
+                context.now + GOALKEEPER_POST_CLEAR_ATTACK_SEC
+            )
+            store.normal_attacker = previous_goalkeeper.id
+            store.goalkeeper_last_handover_at = context.now
+            _log.info(
+                "goalkeeper handover %s -> %s after successful clearance",
+                previous_goalkeeper_id,
+                handover_goalkeeper.id,
+            )
+        store.goalkeeper_handover_candidate_id = None
+        store.goalkeeper_handover_requested_at = None
+    elif pending_handover_id is not None:
+        store.goalkeeper_handover_candidate_id = None
+        store.goalkeeper_handover_requested_at = None
 
     safe_handover_window = phase in (Phase.READY, Phase.STOPPED)
     if safe_handover_window and default_goalkeeper is not None:
@@ -430,6 +478,7 @@ def _clear_normal_sticky(store) -> None:
     store.open_play_our_ball_distance = None
     store.open_play_opponent_ball_distance = None
     store.open_play_distance_advantage = None
+    _reset_goalkeeper_handover_state(store)
 
 
 def _reset_goalkeeper_strategy(store) -> None:
@@ -445,6 +494,16 @@ def _reset_goalkeeper_strategy(store) -> None:
     store.goalkeeper_ball_speed = None
     store.goalkeeper_target = None
     store.goalkeeper_clearance_target = None
+    store.goalkeeper_clear_kicked_at = None
+    store.goalkeeper_clear_ball_x_at_kick = None
+
+
+def _reset_goalkeeper_handover_state(store) -> None:
+    """清除只允许在 NORMAL 中存活的交接请求和反击窗口。"""
+    store.goalkeeper_handover_candidate_id = None
+    store.goalkeeper_handover_requested_at = None
+    store.goalkeeper_post_clear_attacker_id = None
+    store.goalkeeper_post_clear_attack_until = None
 
 
 def _player_dist_to_ball(context: Context, p: Player) -> float:
@@ -493,6 +552,34 @@ def _classify_open_play_availability(
     return OpenPlayAvailability.UNAVAILABLE
 
 
+def _get_post_clear_attacker(
+    context: Context,
+    field_players: list[Player],
+    store,
+) -> Player | None:
+    """返回仍处于有效反击窗口的原守门员，否则清除过期状态。"""
+    attacker_id = getattr(store, "goalkeeper_post_clear_attacker_id", None)
+    attack_until = getattr(store, "goalkeeper_post_clear_attack_until", None)
+    attack_window_valid = (
+        attacker_id is not None
+        and attack_until is not None
+        and context.now <= attack_until
+        and context.ball is not None
+        and not _ball_in_own_danger_area(context)
+    )
+    if attack_window_valid:
+        attacker = next(
+            (player for player in field_players if player.id == attacker_id),
+            None,
+        )
+        if attacker is not None:
+            return attacker
+
+    store.goalkeeper_post_clear_attacker_id = None
+    store.goalkeeper_post_clear_attack_until = None
+    return None
+
+
 def _assign_open_play_roles(
     context: Context,
     available_players: list[Player],
@@ -527,11 +614,17 @@ def _assign_open_play_roles(
             primary_attacker_id = available_players[0].id
             store.normal_attacker = primary_attacker_id
     elif len(available_players) >= 2 and field_players:
-        primary_attacker = _select_closest_attacker(
+        primary_attacker = _get_post_clear_attacker(
             context,
             field_players,
-            getattr(store, "normal_attacker", None),
+            store,
         )
+        if primary_attacker is None:
+            primary_attacker = _select_closest_attacker(
+                context,
+                field_players,
+                getattr(store, "normal_attacker", None),
+            )
         primary_attacker_id = primary_attacker.id
         store.normal_attacker = primary_attacker_id
 
@@ -787,15 +880,21 @@ def _act_normal_attacking_shape(
     primary_attacker: Player | None,
     front_partner: Player | None,
     store,
+    *,
+    force_primary_handler: bool = False,
 ) -> None:
     """执行普通比赛双前场进攻形态及安全人数降级。"""
     if primary_attacker is None:
         return
     if front_partner is None:
-        _act_attack_ball_handler(primary_attacker, "solo")
+        role_label = (
+            "post_clear_goalkeeper"
+            if force_primary_handler else "solo"
+        )
+        _act_attack_ball_handler(primary_attacker, role_label)
         return
 
-    if _should_front_partner_challenge(
+    if not force_primary_handler and _should_front_partner_challenge(
         context,
         primary_attacker,
         front_partner,
@@ -815,7 +914,11 @@ def _act_normal_attacking_shape(
         primary_attacker,
         front_partner,
     )
-    _act_attack_ball_handler(primary_attacker, "primary")
+    role_label = (
+        "post_clear_goalkeeper"
+        if force_primary_handler else "primary"
+    )
+    _act_attack_ball_handler(primary_attacker, role_label)
     front_partner.move_to_position(support_target)
     front_partner.action = (
         "attack:rebound"
@@ -1041,6 +1144,71 @@ def _estimate_goalkeeper_threat(
     )
 
 
+def _goalkeeper_handover_is_still_valid(
+    context: Context,
+    previous_goalkeeper: Player,
+    handover_goalkeeper: Player,
+    store,
+) -> bool:
+    """在原子应用交接前重新检查球的安全性和候选位置优势。"""
+    ball = context.ball
+    previous_pose = previous_goalkeeper.pose
+    handover_pose = handover_goalkeeper.pose
+    requested_at = getattr(store, "goalkeeper_handover_requested_at", None)
+    if (
+        ball is None
+        or previous_pose is None
+        or handover_pose is None
+        or requested_at is None
+        or context.now - requested_at
+        > GOALKEEPER_HANDOVER_CONFIRM_TIMEOUT_SEC
+        or _ball_in_own_danger_area(context)
+    ):
+        return False
+
+    ball_velocity = _estimate_goalkeeper_ball_velocity(context, store)
+    threat = _estimate_goalkeeper_threat(
+        context,
+        ball_velocity,
+        _nearest_opponent_distance(context),
+    )
+    if threat.fast_goal_threat or threat.position_threat:
+        return False
+
+    previous_goalkeeper_ball_distance = dist(
+        previous_pose.x,
+        previous_pose.y,
+        ball.x,
+        ball.y,
+    )
+    if (
+        previous_goalkeeper_ball_distance
+        > GOALKEEPER_HANDOVER_MAX_ATTACK_DISTANCE_M
+    ):
+        return False
+
+    home_target = _get_goalkeeper_home_target(context)
+    handover_home_distance = dist(
+        handover_pose.x,
+        handover_pose.y,
+        home_target[0],
+        home_target[1],
+    )
+    previous_home_distance = dist(
+        previous_pose.x,
+        previous_pose.y,
+        home_target[0],
+        home_target[1],
+    )
+    return (
+        handover_home_distance
+        <= GOALKEEPER_HANDOVER_MAX_HOME_DISTANCE_M
+        and handover_home_distance
+        + GOALKEEPER_HANDOVER_POSITION_ADVANTAGE_M
+        < previous_home_distance
+    )
+
+
 def _get_goalkeeper_block_target(
     context: Context,
     ball_velocity: tuple[float, float] | None,
@@ -1201,6 +1369,147 @@ def _goalkeeper_has_returned(
         pose is not None
         and dist(pose.x, pose.y, home_target[0], home_target[1])
         <= GOALKEEPER_RETURN_ARRIVE_M
+    )
+
+
+def _select_goalkeeper_handover_candidate(
+    context: Context,
+    goalkeeper: Player,
+    field_players: list[Player],
+    home_target: tuple[float, float],
+    store,
+) -> Player | None:
+    """选择已明显比当前守门员更适合占据动态 home 的场上机器人。"""
+    goalkeeper_pose = goalkeeper.pose
+    if goalkeeper_pose is None or not field_players:
+        return None
+
+    last_handover_at = getattr(store, "goalkeeper_last_handover_at", None)
+    if (
+        last_handover_at is not None
+        and context.now - last_handover_at
+        < GOALKEEPER_HANDOVER_COOLDOWN_SEC
+    ):
+        return None
+
+    candidates = [
+        player for player in field_players if player.pose is not None
+    ]
+    if not candidates:
+        return None
+
+    candidate = min(
+        candidates,
+        key=lambda player: dist(
+            player.pose.x,
+            player.pose.y,
+            home_target[0],
+            home_target[1],
+        ),
+    )
+    candidate_home_distance = dist(
+        candidate.pose.x,
+        candidate.pose.y,
+        home_target[0],
+        home_target[1],
+    )
+    goalkeeper_home_distance = dist(
+        goalkeeper_pose.x,
+        goalkeeper_pose.y,
+        home_target[0],
+        home_target[1],
+    )
+    candidate_is_near_goal = (
+        candidate_home_distance
+        <= GOALKEEPER_HANDOVER_MAX_HOME_DISTANCE_M
+    )
+    candidate_has_position_advantage = (
+        candidate_home_distance + GOALKEEPER_HANDOVER_POSITION_ADVANTAGE_M
+        < goalkeeper_home_distance
+    )
+    if candidate_is_near_goal and candidate_has_position_advantage:
+        return candidate
+    return None
+
+
+def _request_goalkeeper_handover_after_clear(
+    context: Context,
+    goalkeeper: Player,
+    field_players: list[Player],
+    home_target: tuple[float, float],
+    threat: GoalkeeperThreatEstimate,
+    allow_active_response: bool,
+    store,
+) -> None:
+    """确认解围产生正 X 进展后，提交下一帧应用的激进交接请求。"""
+    clear_kicked_at = getattr(store, "goalkeeper_clear_kicked_at", None)
+    clear_ball_x_at_kick = getattr(
+        store, "goalkeeper_clear_ball_x_at_kick", None,
+    )
+    if clear_kicked_at is None or clear_ball_x_at_kick is None:
+        return
+
+    if not allow_active_response:
+        store.goalkeeper_clear_kicked_at = None
+        store.goalkeeper_clear_ball_x_at_kick = None
+        return
+
+    confirmation_elapsed = context.now - clear_kicked_at
+    if confirmation_elapsed < GOALKEEPER_HANDOVER_CONFIRM_MIN_SEC:
+        return
+    if confirmation_elapsed > GOALKEEPER_HANDOVER_CONFIRM_TIMEOUT_SEC:
+        store.goalkeeper_clear_kicked_at = None
+        store.goalkeeper_clear_ball_x_at_kick = None
+        return
+
+    ball = context.ball
+    goalkeeper_pose = goalkeeper.pose
+    if ball is None or goalkeeper_pose is None:
+        store.goalkeeper_clear_kicked_at = None
+        store.goalkeeper_clear_ball_x_at_kick = None
+        return
+
+    goalkeeper_ball_distance = dist(
+        goalkeeper_pose.x,
+        goalkeeper_pose.y,
+        ball.x,
+        ball.y,
+    )
+    if goalkeeper_ball_distance > GOALKEEPER_HANDOVER_MAX_ATTACK_DISTANCE_M:
+        store.goalkeeper_clear_kicked_at = None
+        store.goalkeeper_clear_ball_x_at_kick = None
+        return
+
+    clearance_confirmed = (
+        ball.x - clear_ball_x_at_kick
+        >= GOALKEEPER_HANDOVER_CLEAR_PROGRESS_M
+        and not _ball_in_own_danger_area(context)
+        and not threat.fast_goal_threat
+        and not threat.position_threat
+    )
+    handover_already_pending = (
+        getattr(store, "goalkeeper_handover_candidate_id", None) is not None
+    )
+    if not clearance_confirmed or handover_already_pending:
+        return
+
+    candidate = _select_goalkeeper_handover_candidate(
+        context,
+        goalkeeper,
+        field_players,
+        home_target,
+        store,
+    )
+    if candidate is None:
+        return
+
+    store.goalkeeper_handover_candidate_id = candidate.id
+    store.goalkeeper_handover_requested_at = context.now
+    _log.info(
+        "goalkeeper handover requested %s -> %s after clear progress %.2f",
+        goalkeeper.id,
+        candidate.id,
+        ball.x - clear_ball_x_at_kick,
     )
 
 
@@ -1379,12 +1688,20 @@ def _draw_goalkeeper_strategy(
     )
     speed = getattr(store, "goalkeeper_ball_speed", None)
     speed_label = "n/a" if speed is None else f"{speed:.2f}"
+    handover_candidate = getattr(
+        store, "goalkeeper_handover_candidate_id", None,
+    )
+    post_clear_attacker = getattr(
+        store, "goalkeeper_post_clear_attacker_id", None,
+    )
     debugdraw.text(
         0.0,
         context.field.width / 2.0 + 0.9,
         (
             f"goalkeeper={goalkeeper_kind} mode={mode.value} "
-            f"reason={store.goalkeeper_threat_reason} speed={speed_label}"
+            f"reason={store.goalkeeper_threat_reason} speed={speed_label} "
+            f"handover={handover_candidate or '-'} "
+            f"counter={post_clear_attacker or '-'}"
         ),
         rgb=(0.2, 0.8, 1.0),
         ns="goalkeeper_mode",
@@ -1418,6 +1735,15 @@ def _act_goalkeeper_strategy(
         opponent_nearest_distance,
     )
     home_target = _get_goalkeeper_home_target(context)
+    _request_goalkeeper_handover_after_clear(
+        context,
+        goalkeeper,
+        field_players,
+        home_target,
+        threat,
+        allow_active_response,
+        store,
+    )
     current_mode = getattr(store, "goalkeeper_mode", None)
     open_play_mode = getattr(store, "open_play_mode", None)
     has_explicit_field_protection = open_play_mode in (
@@ -1501,6 +1827,14 @@ def _act_goalkeeper_strategy(
             goalkeeper_subaction = goalkeeper.action.removeprefix(
                 "goalkeeper:clear:",
             )
+            if (
+                goalkeeper_subaction == "kick"
+                and ball is not None
+                and getattr(store, "goalkeeper_clear_kicked_at", None)
+                is None
+            ):
+                store.goalkeeper_clear_kicked_at = context.now
+                store.goalkeeper_clear_ball_x_at_kick = ball.x
     else:
         target = home_target
         goalkeeper.guard(
@@ -1902,6 +2236,24 @@ def _act_normal(
     open_play_mode = _update_open_play_mode(
         context, mode_estimate, store,
     )
+    post_clear_counterattack = (
+        primary_attacker is not None
+        and primary_attacker.id
+        == getattr(store, "goalkeeper_post_clear_attacker_id", None)
+        and not mode_estimate.ball_in_own_danger_area
+    )
+    if post_clear_counterattack:
+        if open_play_mode != OpenPlayMode.ATTACKING:
+            store.open_play_mode_entered_at = context.now
+            store.open_play_last_switch_at = context.now
+            store.open_play_last_switch_reason = (
+                "goalkeeper_post_clear_counterattack"
+            )
+        open_play_mode = OpenPlayMode.ATTACKING
+        store.open_play_mode = open_play_mode
+        store.open_play_mode_reason = (
+            "goalkeeper_post_clear_counterattack"
+        )
     _draw_open_play_mode(context, store)
 
     challenge_player = primary_attacker
@@ -1954,6 +2306,7 @@ def _act_normal(
             primary_attacker,
             front_partner,
             store,
+            force_primary_handler=post_clear_counterattack,
         )
         return
     if open_play_mode == OpenPlayMode.DEFENDING:

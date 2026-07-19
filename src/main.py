@@ -348,8 +348,24 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
 
         # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
         if phase == Phase.NORMAL:
-            _clear_kickoff_tactic(store, "referee_window_cleared")
-            _act_normal(context, available_players, current_goalkeeper, store)
+            if _should_finish_kickoff_second_touch(context, store):
+                # 第一脚触球后裁判机可能立即清除 kickoff 标记。此时规则已
+                # 进入开放比赛，但仍保留锁定角色完成既定第二脚射门。
+                _clear_normal_sticky(store)
+                _act_our_kickoff(
+                    context,
+                    available_players,
+                    current_goalkeeper,
+                    store,
+                )
+            else:
+                _clear_kickoff_tactic(store, "referee_window_cleared")
+                _act_normal(
+                    context,
+                    available_players,
+                    current_goalkeeper,
+                    store,
+                )
         elif phase == Phase.OUR_KICKOFF:
             _clear_normal_sticky(store)
             _act_our_kickoff(
@@ -3766,6 +3782,37 @@ def _is_our_kickoff_playing(context: Context) -> bool:
         and game.kicking_team == context.team_id
         and game.secondary_time > 0
         and game.set_play == SetPlay.NONE
+    )
+
+
+def _should_finish_kickoff_second_touch(context: Context, store) -> bool:
+    """裁判开球标记清除后，仅延续已成功启动的二脚射门。"""
+    roles = getattr(store, "kickoff_roles", None)
+    if roles is None:
+        return False
+
+    state = getattr(
+        store,
+        "kickoff_tactic_state",
+        KickoffTacticState.IDLE,
+    )
+    if state in (
+        KickoffTacticState.RECEIVE_AND_SHOOT,
+        KickoffTacticState.VERIFY_SECOND_TOUCH,
+    ):
+        return bool(
+            getattr(store, "kickoff_first_touch_confirmed", False),
+        )
+
+    if state != KickoffTacticState.VERIFY_FIRST_TOUCH:
+        return False
+
+    # 不能只凭本地状态或倒计时延续战术；必须观测到第一脚确实把球
+    # 朝锁定接球点送出，才允许在开放比赛中完成第二次触球。
+    return _kickoff_ball_has_moved_toward_receive(
+        context,
+        store,
+        roles.receive_target,
     )
 
 

@@ -79,7 +79,7 @@
 ## T01 Compatibility
 
 - `get_phase()` 和 stopped 优先级不改。
-- `_prepare_restart_target()`、1.5m 参数和安全 `walk_to()` 不改。
+- `_prepare_restart_target()` 和安全 `walk_to()` 不改；根据用户实测，将共用避让参数从 1.5m 提高到 1.6m。
 - `_act_opp_set_play()` 仍为独立逻辑，不调用 `_act_normal()`。
 - 受罚或异常的默认守门员不会被传入 T01 guard 分支；统一选择层会提供临时守门员。
 

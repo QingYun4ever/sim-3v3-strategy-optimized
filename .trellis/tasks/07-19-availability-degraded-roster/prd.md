@@ -10,7 +10,7 @@
 - 不可用 action 已大致区分 `penalized / fallen / switching_mode / no_pose`，但摔倒和切模式分支没有统一显式停车。
 - 当前 `_act_normal()`、丢球恢复、我方开球、T01 对方中场开球和对方 set play 都会在各自函数内重新按离己方门距离选择 guard，没有统一的当前守门员身份。
 - `GameControlState.get_team_state()` 返回的 `TeamState.goalkeeper` 是现有裁判协议中的默认守门员字段；字段为 `0` 或不匹配本队 roster 时，需要稳定回退约定。
-- T01 已完成并经用户手动验证：STOP/SET 安全、对方重启禁止抢球、目标点 1.5m 避让。T02 不得破坏这些行为。
+- T01 已完成并经用户手动验证：STOP/SET 安全、对方重启禁止抢球。后续实测发现 1.5m 余量过小，用户要求将对方重启目标避让提高到 1.6m；T02 不得破坏这些行为。
 
 ## Requirements
 
@@ -63,6 +63,7 @@
 - 优先只修改 `src/main.py`，必要时在 `src/param.py` 增加默认守门员参数。
 - 不修改 `src/framework/` 协议，不引入依赖。
 - 不实现普通进攻、防守或守门员动作增强，不实现任何专项固定战术。
+- 对方中场开球及所有对方 set play 共用 `OPPONENT_RESTART_AVOID_M = 1.6`，降低边界误差导致的罚下风险。
 - 按项目规则不运行 build、test、lint、type-check、format、仿真、开发服务器或 IDE 诊断。
 
 ## Acceptance Criteria
@@ -75,7 +76,7 @@
 - [ ] READY/STOPPED 且默认守门员 available 时，临时守门员记录被清除并交还默认守门员。
 - [ ] 3/2/1/0 台 available 均有明确且不报错的分派入口；1 台时按球门危险条件选择守门或普通处理球。
 - [ ] `store.available_field_player_ids` 和两人固定战术可用标记可供后续任务使用。
-- [ ] `_act_opp_set_play()` 仍不调用 `_act_normal()`，T01 对方重启安全走位和 1.5m 避让保持不变。
+- [ ] `_act_opp_set_play()` 仍不调用 `_act_normal()`，对方重启安全走位保持不变，避让目标距离提高到 1.6m。
 - [ ] 未实现任何明确排除的后续策略，未运行自动验证命令。
 
 ## Out of Scope

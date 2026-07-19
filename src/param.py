@@ -126,7 +126,7 @@ CENTER_LEAVE_DIST_M = 0.15 # 球离开中心点多少距离，认为球已经动
 # 站位 / 避让
 # ======================================================================
 
-OPPONENT_RESTART_AVOID_M = 1.5
+OPPONENT_RESTART_AVOID_M = 1.6
 CIRCLE_MARGIN_M = 0.3
 
 

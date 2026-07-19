@@ -496,10 +496,286 @@ def _act_normal_front_partner(front_partner: Player) -> None:
     front_partner.action = "normal:front_partner:support"
 
 
+def _get_attack_subaction(player: Player) -> str:
+    """把 Player.attack 的内部状态压缩为可读的策略标签。"""
+    if player.action.startswith("attack:"):
+        return player.action.removeprefix("attack:")
+    return "kick" if player.is_kicking else "chase"
+
+
+def _act_attack_ball_handler(player: Player, role_label: str) -> None:
+    """执行 attack,并保留绕球、追球或踢球子动作。"""
+    player.action = "attack"
+    player.attack()
+    player.action = f"attack:{role_label}:{_get_attack_subaction(player)}"
+
+
+def _select_attack_support_side(
+    context: Context,
+    ball_handler: Player,
+    supporting_player: Player,
+    goal_direction: tuple[float, float],
+) -> float:
+    """选择接应侧:边线附近向内,其他位置优先避开主攻到球线路。"""
+    ball = context.ball
+    if (
+        ball is None
+        or ball_handler.pose is None
+        or supporting_player.pose is None
+    ):
+        return 1.0
+
+    lateral_direction = (-goal_direction[1], goal_direction[0])
+    handler_lateral_offset = (
+        (ball_handler.pose.x - ball.x) * lateral_direction[0]
+        + (ball_handler.pose.y - ball.y) * lateral_direction[1]
+    )
+    supporting_lateral_offset = (
+        (supporting_player.pose.x - ball.x) * lateral_direction[0]
+        + (supporting_player.pose.y - ball.y) * lateral_direction[1]
+    )
+    half_width = context.field.width / 2.0
+    ball_near_touchline = (
+        half_width - abs(ball.y)
+        <= NORMAL_ATTACK_SUPPORT_TOUCHLINE_ZONE_M
+    )
+
+    best_side = 1.0
+    best_score = -math.inf
+    for candidate_side in (-1.0, 1.0):
+        score = 0.0
+        candidate_y_direction = candidate_side * lateral_direction[1]
+        if ball_near_touchline and candidate_y_direction * ball.y < 0.0:
+            score += 4.0
+        if (
+            abs(handler_lateral_offset) > 1e-6
+            and candidate_side * handler_lateral_offset < 0.0
+        ):
+            score += 2.0
+        if candidate_side * supporting_lateral_offset >= 0.0:
+            score += 0.5
+        if score > best_score:
+            best_side = candidate_side
+            best_score = score
+    return best_side
+
+
+def _ball_in_attack_rebound_area(context: Context) -> bool:
+    """判断球是否进入对方禁区附近的补射、二点球区域。"""
+    ball = context.ball
+    if ball is None:
+        return False
+
+    opponent_goal_line_x = context.field.length / 2.0
+    distance_inside_goal_line = opponent_goal_line_x - ball.x
+    return (
+        -NORMAL_ATTACK_REBOUND_PENALTY_MARGIN_M
+        <= distance_inside_goal_line
+        <= context.field.penalty_area_length
+        + NORMAL_ATTACK_REBOUND_PENALTY_MARGIN_M
+        and abs(ball.y)
+        <= context.field.penalty_area_width / 2.0
+        + NORMAL_ATTACK_REBOUND_PENALTY_MARGIN_M
+    )
+
+
+def _get_dynamic_attack_support_target(
+    context: Context,
+    ball_handler: Player,
+    supporting_player: Player,
+) -> tuple[float, float] | None:
+    """计算围绕当前球位、朝向对方球门的动态接应或补射站位。"""
+    ball = context.ball
+    if (
+        ball is None
+        or ball_handler.pose is None
+        or supporting_player.pose is None
+    ):
+        return None
+
+    opponent_goal_x, opponent_goal_y = opponent_goal(context)
+    goal_offset_x = opponent_goal_x - ball.x
+    goal_offset_y = opponent_goal_y - ball.y
+    goal_distance = math.hypot(goal_offset_x, goal_offset_y)
+    if goal_distance <= 1e-6:
+        goal_direction = (1.0, 0.0)
+    else:
+        goal_direction = (
+            goal_offset_x / goal_distance,
+            goal_offset_y / goal_distance,
+        )
+    lateral_direction = (-goal_direction[1], goal_direction[0])
+    support_side = _select_attack_support_side(
+        context,
+        ball_handler,
+        supporting_player,
+        goal_direction,
+    )
+
+    near_opponent_penalty_area = _ball_in_attack_rebound_area(context)
+    if near_opponent_penalty_area:
+        forward_distance = NORMAL_ATTACK_REBOUND_FORWARD_DISTANCE_M
+        lateral_distance = NORMAL_ATTACK_REBOUND_LATERAL_DISTANCE_M
+    else:
+        forward_distance = NORMAL_ATTACK_SUPPORT_FORWARD_DISTANCE_M
+        lateral_distance = NORMAL_ATTACK_SUPPORT_LATERAL_DISTANCE_M
+
+    def build_target(selected_lateral_distance: float) -> tuple[float, float]:
+        return (
+            ball.x + goal_direction[0] * forward_distance
+            + lateral_direction[0] * support_side * selected_lateral_distance,
+            ball.y + goal_direction[1] * forward_distance
+            + lateral_direction[1] * support_side * selected_lateral_distance,
+        )
+
+    target_x, target_y = build_target(lateral_distance)
+    distance_from_handler = dist(
+        target_x,
+        target_y,
+        ball_handler.pose.x,
+        ball_handler.pose.y,
+    )
+    if distance_from_handler < NORMAL_ATTACK_SUPPORT_PRIMARY_SPACING_M:
+        lateral_distance += (
+            NORMAL_ATTACK_SUPPORT_PRIMARY_SPACING_M - distance_from_handler
+        )
+        target_x, target_y = build_target(lateral_distance)
+
+    half_length = max(
+        0.0,
+        context.field.length / 2.0 - NORMAL_ATTACK_SUPPORT_FIELD_MARGIN_M,
+    )
+    half_width = max(
+        0.0,
+        context.field.width / 2.0 - NORMAL_ATTACK_SUPPORT_FIELD_MARGIN_M,
+    )
+    clamped_target_x = clamp(target_x, -half_length, half_length)
+    clamped_target_y = clamp(target_y, -half_width, half_width)
+    clamped_handler_distance = dist(
+        clamped_target_x,
+        clamped_target_y,
+        ball_handler.pose.x,
+        ball_handler.pose.y,
+    )
+    if clamped_handler_distance < NORMAL_ATTACK_SUPPORT_PRIMARY_SPACING_M:
+        away_from_handler_x = clamped_target_x - ball_handler.pose.x
+        away_from_handler_y = clamped_target_y - ball_handler.pose.y
+        away_length = math.hypot(away_from_handler_x, away_from_handler_y)
+        if away_length <= 1e-6:
+            away_from_handler_x = lateral_direction[0] * support_side
+            away_from_handler_y = lateral_direction[1] * support_side
+            away_length = 1.0
+        spacing_scale = NORMAL_ATTACK_SUPPORT_PRIMARY_SPACING_M / away_length
+        clamped_target_x = clamp(
+            ball_handler.pose.x + away_from_handler_x * spacing_scale,
+            -half_length,
+            half_length,
+        )
+        clamped_target_y = clamp(
+            ball_handler.pose.y + away_from_handler_y * spacing_scale,
+            -half_width,
+            half_width,
+        )
+    return (clamped_target_x, clamped_target_y)
+
+
+def _should_front_partner_challenge(
+    context: Context,
+    primary_attacker: Player,
+    front_partner: Player,
+) -> bool:
+    """允许近球且明显更近的搭档临时接管,不改变粘滞角色。"""
+    if primary_attacker.is_kicking:
+        return False
+    partner_distance = _player_dist_to_ball(context, front_partner)
+    primary_distance = _player_dist_to_ball(context, primary_attacker)
+    return (
+        partner_distance <= NORMAL_ATTACK_PARTNER_CHALLENGE_DISTANCE_M
+        and partner_distance + NORMAL_ATTACK_PARTNER_CLOSER_MARGIN_M
+        < primary_distance
+    )
+
+
+def _act_normal_attacking_shape(
+    context: Context,
+    goalkeeper: Player | None,
+    primary_attacker: Player | None,
+    front_partner: Player | None,
+    store,
+) -> None:
+    """执行普通比赛双前场进攻形态及安全人数降级。"""
+    if goalkeeper is not None:
+        goalkeeper.guard()
+        goalkeeper_kind = (
+            "temporary"
+            if goalkeeper.id == getattr(
+                store, "temporary_goalkeeper_id", None,
+            )
+            else "default"
+        )
+        goalkeeper.action = f"attack:goalkeeper:{goalkeeper_kind}"
+
+    if primary_attacker is None:
+        return
+    if front_partner is None:
+        _act_attack_ball_handler(primary_attacker, "solo")
+        return
+
+    if _should_front_partner_challenge(
+        context,
+        primary_attacker,
+        front_partner,
+    ):
+        followup_target = _get_dynamic_attack_support_target(
+            context,
+            front_partner,
+            primary_attacker,
+        )
+        _act_attack_ball_handler(front_partner, "partner_challenge")
+        primary_attacker.move_to_position(followup_target)
+        primary_attacker.action = "attack:partner_support"
+        return
+
+    support_target = _get_dynamic_attack_support_target(
+        context,
+        primary_attacker,
+        front_partner,
+    )
+    _act_attack_ball_handler(primary_attacker, "primary")
+    front_partner.move_to_position(support_target)
+    front_partner.action = (
+        "attack:rebound"
+        if _ball_in_attack_rebound_area(context)
+        else "attack:partner_support"
+    )
+
+
 def _should_enter_normal_defense(context: Context) -> bool:
     """只在已知球明确进入己方半场时启用普通比赛防守阵型。"""
     ball = context.ball
     return ball is not None and ball.x < NORMAL_DEFENSE_BALL_X_MAX_M
+
+
+def _should_single_player_guard(context: Context, player: Player) -> bool:
+    """单人降级时仅在球门危险或机器人仍在门前时坚持守门。"""
+    ball = context.ball
+    if ball is None or player.pose is None:
+        return True
+
+    own_penalty_edge_x = (
+        -context.field.length / 2.0 + context.field.penalty_area_length
+    )
+    if ball.x <= own_penalty_edge_x:
+        return True
+
+    own_goal_x, own_goal_y = own_goal(context)
+    goal_protection_distance = context.field.penalty_area_length + 0.5
+    return dist(
+        player.pose.x,
+        player.pose.y,
+        own_goal_x,
+        own_goal_y,
+    ) <= goal_protection_distance
 
 
 def _get_normal_defense_protect_target(
@@ -623,7 +899,7 @@ def _act_normal(
     *,
     allow_ball_search: bool = True,
 ) -> None:
-    """NORMAL:消费基础职责分配并执行现有 guard/attack/support 动作。
+    """NORMAL:分派守门、T04 防守或 T05 双前场进攻动作。
 
     固定战术未来可在调用本入口前独立分派,从而绕过普通比赛角色分配。
     """
@@ -688,6 +964,37 @@ def _act_normal(
         )
         return
 
+    if (
+        allow_ball_search
+        and assignment.availability == OpenPlayAvailability.DEGRADED_ONE
+        and role_goalkeeper is not None
+        and primary_attacker is None
+    ):
+        if _should_single_player_guard(context, role_goalkeeper):
+            _act_goalkeeper_guard(role_goalkeeper, store)
+        else:
+            # 保留 T02 的单人远离己方门时处理球降级，不改变守门员身份状态。
+            _act_normal_attacking_shape(
+                context,
+                None,
+                role_goalkeeper,
+                None,
+                store,
+            )
+        return
+
+    if allow_ball_search:
+        _act_normal_attacking_shape(
+            context,
+            role_goalkeeper,
+            primary_attacker,
+            front_partner,
+            store,
+        )
+        return
+
+    # OUR_SET_PLAY reuses this entry point with ball search disabled. Keep its
+    # existing non-T05 fallback until dedicated restart tactics are added.
     if role_goalkeeper is not None:
         _act_goalkeeper_guard(role_goalkeeper, store)
     if primary_attacker is not None:
